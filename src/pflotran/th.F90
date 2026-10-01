@@ -1,0 +1,6001 @@
+module TH_module
+
+#include "petsc/finclude/petscsnes.h"
+  use petscsnes
+
+  use TH_Aux_module
+  use TH_Well_module
+  use Global_Aux_module
+  use Material_Aux_module
+  use PFLOTRAN_Constants_module
+  use Utility_module, only : Equal
+
+  implicit none
+
+  private
+
+! Cutoff parameters
+  PetscReal, parameter :: eps       = 1.D-8
+  PetscReal, parameter :: floweps   = 1.D-24
+  PetscReal, parameter :: perturbation_tolerance = 1.d-8
+  PetscReal, parameter :: unit_z(3) = [0.d0,0.d0,1.d0]
+
+  public THResidual, &
+         THJacobian, &
+         THUpdateFixedAccumulation, &
+         THTimeCut, &
+         THSetup, &
+         THNumericalJacobianTest, &
+         THMaxChange, &
+         THUpdateSolution, &
+         THGetTecplotHeader, &
+         THInitializeTimestep, &
+         THComputeMassBalance, &
+         THResidualToMass, &
+         THUpdateAuxVars, &
+         THDestroy, &
+         THAccumulation, &
+         THResidualInternalConn, &
+         THResidualBoundaryConn, &
+         THResidualSourceSink, &
+         THJacobianInternalConn, &
+         THJacobianBoundaryConn, &
+         THJacobianSourceSink, &
+         THUpdateLocalVecs, &
+         THApplyPrescribedConditions, &
+         THMapBCAuxVarsToGlobal
+
+  PetscInt, parameter :: jh2o = 1
+
+contains
+
+! ************************************************************************** !
+
+subroutine THTimeCut(realization,pm_well)
+  !
+  ! Resets arrays for time step cut
+  !
+  ! Author: ???
+  ! Date: 12/13/07
+  !
+
+  use Realization_Subsurface_class
+  use PM_Well_class
+
+  implicit none
+
+  class(realization_subsurface_type) :: realization
+  class(pm_well_type), pointer :: pm_well
+
+  th_ts_cut_count = th_ts_cut_count + 1
+  call THInitializeTimestep(realization,pm_well)
+
+end subroutine THTimeCut
+
+! ************************************************************************** !
+
+subroutine THSetup(realization,pm_well)
+  !
+  ! Author: ???
+  ! Date: 02/22/08
+  !
+
+  use Realization_Subsurface_class
+  use Patch_module
+  use Output_Aux_module
+  use Option_module
+  use Grid_module
+  use Region_module
+  use Coupler_module
+  use Connection_module
+  use Fluid_module
+  use Secondary_Continuum_Aux_module
+  use Secondary_Continuum_module
+  use Characteristic_Curves_Thermal_module
+  use String_module, only : StringWrite
+  use PM_Well_class
+
+  class(realization_subsurface_type), pointer :: realization
+  class(pm_well_type), pointer :: pm_well
+
+  type(output_variable_list_type), pointer :: list
+  type(option_type), pointer :: option
+  type(patch_type), pointer :: patch
+  type(grid_type), pointer :: grid
+  type(coupler_type), pointer :: boundary_condition, cur_coupler
+  type(th_auxvar_type), pointer :: th_auxvars(:), th_auxvars_bc(:)
+  type(th_auxvar_type), pointer :: th_auxvars_ss(:)
+  type(fluid_property_type), pointer :: cur_fluid_property
+  type(sec_heat_type), pointer :: TH_sec_heat_vars(:)
+  type(coupler_type), pointer :: initial_condition
+  class(cc_thermal_type), pointer :: thermal_cc
+  character(len=MAXWORDLENGTH) :: word
+
+  PetscInt :: ghosted_id, iconn, sum_connection, local_id
+  PetscInt :: i, iphase, material_id, icct
+  PetscInt :: num_tcc
+  PetscBool :: error_found
+  PetscReal :: tempreal
+  PetscBool, allocatable :: dof_is_active(:)
+  PetscErrorCode :: ierr
+
+  option => realization%option
+  patch => realization%patch
+  grid => patch%grid
+
+  patch%aux%TH => THAuxCreate(option)
+  patch%aux%SC_heat => SecondaryAuxHeatCreate(option)
+
+! option%io_buffer = 'Before TH can be run, the th_parameter object ' // &
+!                    'must be initialized with the proper variables ' // &
+!                    'THAuxCreate() is called anywhere.'
+
+! call printErrMsg(option)
+
+  if (option%flow%th_freezing) then
+    allocate(patch%aux%TH%th_parameter%sir(option%nphase, &
+              size(patch%saturation_function_array)))
+  else
+    allocate(patch%aux%TH%th_parameter%sir(option%nphase, &
+              size(patch%characteristic_curves_array)))
+
+  endif
+
+  !Jitu, 08/04/2010: Check these allocations. Currently assumes only
+  !single value in the array <modified pcl 1-13-11>
+  num_tcc = size(patch%char_curves_thermal_array)
+  allocate(patch%aux%TH%th_parameter%dencpr(num_tcc))
+  allocate(patch%aux%TH%th_parameter%ckwet(num_tcc))
+  allocate(patch%aux%TH%th_parameter%ckdry(num_tcc))
+  allocate(patch%aux%TH%th_parameter%alpha(num_tcc))
+  if (option%flow%th_freezing) then
+   allocate(patch%aux%TH%th_parameter%ckfrozen(num_tcc))
+   allocate(patch%aux%TH%th_parameter%alpha_fr(num_tcc))
+  endif
+
+  if (num_tcc == 0) then
+    call PrintErrMsg(option,'No thermal conductivities specified for TH.')
+  endif
+  do icct = 1, num_tcc
+    if (.not.associated(patch%char_curves_thermal_array(icct)%ptr)) then
+      call PrintErrMsg(option,'Unassociated thermal conductivity in TH.')
+    endif
+  enddo
+  if (num_tcc /= size(patch%material_property_array)) then
+    option%io_buffer = 'Number of thermal characteristic curves must match &
+                       &the number of materials in TH due to dencpr being &
+                       &allocated to size(patch%char_curves_thermal_array'
+    call PrintErrMsg(option)
+  endif
+
+  if (.not.associated(patch%char_curves_thermal_array)) then
+    option%io_buffer = 'Thermal properties must be added to all &
+      &material properties (MATERIAL_PROPERTY).'
+    call PrintErrMsg(option)
+  endif
+
+  !Copy the values in the th_parameter from the global realization
+  error_found = PETSC_FALSE
+  do i = 1, size(patch%material_property_array)
+    word = patch%material_property_array(i)%ptr%name
+    if (Uninitialized(patch%material_property_array(i)%ptr%specific_heat)) then
+      option%io_buffer = 'ERROR: Non-initialized HEAT_CAPACITY in material ' &
+                         // trim(word)
+      call PrintMsgByRank(option)
+      error_found = PETSC_TRUE
+    endif
+    if (Uninitialized(patch%material_property_array(i)%ptr%rock_density)) then
+      option%io_buffer = 'ERROR: Non-initialized ROCK_DENSITY in material ' &
+                         // trim(word)
+      call PrintMsgByRank(option)
+      error_found = PETSC_TRUE
+    endif
+
+    material_id = abs(patch%material_property_array(i)%ptr%internal_id)
+
+    icct = patch%material_property_array(i)%ptr% &
+                thermal_conductivity_function_id
+
+    thermal_cc => patch%char_curves_thermal_array(icct)%ptr
+
+    ! kg rock/m^3 rock * J/kg rock-K * 1.e-6 MJ/J = MJ/m^3-K
+    patch%aux%TH%th_parameter%dencpr(icct) = &
+      patch%material_property_array(i)%ptr%rock_density*option%scale* &
+        patch%material_property_array(i)%ptr%specific_heat
+
+    select type(tcf => thermal_cc%thermal_conductivity_function)
+      !------------------------------------------
+      type is(kt_frozen_type)
+        patch%aux%TH%th_parameter%ckdry(icct) = tcf%kT_dry*option%scale
+        patch%aux%TH%th_parameter%ckwet(icct) = tcf%kT_wet*option%scale
+        tcf%kT_dry = tcf%kT_dry*option%scale ! apply scale to original value
+        tcf%kT_wet = tcf%kT_wet*option%scale ! apply scale to original value
+        patch%aux%TH%th_parameter%alpha(icct) = tcf%alpha
+        if (option%flow%th_freezing) then
+          patch%aux%TH%th_parameter%alpha_fr(icct) = tcf%alpha_fr
+          patch%aux%TH%th_parameter%ckfrozen(icct) = &
+          tcf%kT_frozen*option%scale
+          tcf%kT_frozen = tcf%kT_frozen*option%scale ! apply scale to original value
+        endif
+      !------------------------------------------
+      type is(kt_constant_type)
+        patch%aux%TH%th_parameter%ckdry(icct) = &
+          tcf%constant_thermal_conductivity*option%scale
+        patch%aux%TH%th_parameter%ckwet(icct) = &
+          tcf%constant_thermal_conductivity*option%scale
+        tcf%constant_thermal_conductivity = &
+          tcf%constant_thermal_conductivity*option%scale ! apply scale to original value
+        patch%aux%TH%th_parameter%alpha(icct) = tcf%alpha
+      !------------------------------------------
+      type is(kt_default_type)
+        patch%aux%TH%th_parameter%ckdry(icct) = tcf%kT_dry*option%scale
+        patch%aux%TH%th_parameter%ckwet(icct) = tcf%kT_wet*option%scale
+        tcf%kT_dry = tcf%kT_dry*option%scale ! apply scale to original value
+        tcf%kT_wet = tcf%kT_wet*option%scale ! apply scale to original value
+        patch%aux%TH%th_parameter%alpha(icct) = tcf%alpha
+      !------------------------------------------
+      type is(kt_linear_type)
+        patch%aux%TH%th_parameter%ckdry(icct) = tcf%kT_dry*option%scale
+        patch%aux%TH%th_parameter%ckwet(icct) = tcf%kT_wet*option%scale
+        tcf%kT_dry = tcf%kT_dry*option%scale ! apply scale to original value
+        tcf%kT_wet = tcf%kT_wet*option%scale ! apply scale to original value
+        patch%aux%TH%th_parameter%alpha(icct) = tcf%alpha
+      !------------------------------------------
+      type is(kt_linear_resistivity_type)
+        patch%aux%TH%th_parameter%ckdry(icct) = tcf%kT_dry*option%scale
+        patch%aux%TH%th_parameter%ckwet(icct) = tcf%kT_wet*option%scale
+        tcf%kT_dry = tcf%kT_dry*option%scale ! apply scale to original value
+        tcf%kT_wet = tcf%kT_wet*option%scale ! apply scale to original value
+        patch%aux%TH%th_parameter%alpha(icct) = tcf%alpha
+      !------------------------------------------
+      type is(kt_cubic_polynomial_type)
+        patch%aux%TH%th_parameter%ckdry(icct) = tcf%kT_dry*option%scale
+        patch%aux%TH%th_parameter%ckwet(icct) = tcf%kT_wet*option%scale
+        tcf%kT_dry = tcf%kT_dry*option%scale ! apply scale to original value
+        tcf%kT_wet = tcf%kT_wet*option%scale ! apply scale to original value
+        patch%aux%TH%th_parameter%alpha(icct) = tcf%alpha
+      !------------------------------------------
+      type is(kt_power_type)
+        patch%aux%TH%th_parameter%ckdry(icct) = tcf%kT_dry*option%scale
+        patch%aux%TH%th_parameter%ckwet(icct) = tcf%kT_wet*option%scale
+        tcf%kT_dry = tcf%kT_dry*option%scale ! apply scale to original value
+        tcf%kT_wet = tcf%kT_wet*option%scale ! apply scale to original value
+        patch%aux%TH%th_parameter%alpha(icct) = tcf%alpha
+      class default
+        option%io_buffer = 'ERROR: TH mode does not support thermal '&
+                         //'characteristic curve "' // trim(thermal_cc%name) &
+                         //'" in material: ' // trim(word)
+        call PrintErrMsg(option)
+    end select
+
+    if (.not. associated(thermal_cc%thermal_conductivity_function)) then
+      option%io_buffer = 'ERROR: Non-initialized thermal conductivity function &
+                         &in material ' // trim(word)
+      call PrintMsgByRank(option)
+      error_found = PETSC_TRUE
+    endif
+
+    if (Uninitialized(patch%aux%TH%th_parameter%alpha(icct))) then
+      option%io_buffer = 'ERROR: Non-initialized KERSTEN EXPONENT '&
+                       //'in material ' // trim(word)
+      call PrintMsgByRank(option)
+      error_found = PETSC_TRUE
+    endif
+
+    if (option%flow%th_freezing) then
+      if (patch%aux%TH%th_parameter%ckfrozen(icct) < 0.0d0 ) then
+        option%io_buffer = 'ERROR: Non-initialized FROZEN THERMAL '&
+        //'CONDUCTIVITY when freezing activated in '&
+        //'material ' // trim(word)
+        call PrintMsgByRank(option)
+        error_found = PETSC_TRUE
+      endif
+      if (Uninitialized(patch%aux%TH%th_parameter%alpha_fr(icct))) then
+        option%io_buffer = 'ERROR: Non-initialized FROZEN KERSTEN EXPONENT '&
+                         //'when freezing activated in material ' // trim(word)
+        call PrintMsgByRank(option)
+        error_found = PETSC_TRUE
+      endif
+    endif
+
+    if (patch%aux%TH%th_parameter%ckwet(icct) < 1.d-40 .and. &
+        patch%aux%TH%th_parameter%ckdry(icct) < 1.d-40) then
+      option%io_buffer = 'ERROR: Either the wet or dry thermal conductivity &
+        &must be non-zero in material: ' // trim(word)
+      call PrintMsgByRank(option)
+      error_found = PETSC_TRUE
+    endif
+
+  enddo
+
+  call MPI_Allreduce(MPI_IN_PLACE,error_found,ONE_INTEGER_MPI,MPI_C_BOOL, &
+                     MPI_LOR,option%mycomm,ierr);CHKERRQ(ierr)
+  if (error_found) then
+    option%io_buffer = 'Material property errors found in THSetup.'
+    call PrintErrMsg(option)
+  endif
+
+  if (option%flow%th_freezing) then
+    do i = 1, size(patch%saturation_function_array)
+      patch%aux%TH%th_parameter% &
+        sir(:,patch%saturation_function_array(i)%ptr%id) = &
+        patch%saturation_function_array(i)%ptr%Sr(:)
+    enddo
+  endif
+
+  ! allocate auxvar data structures for all grid cells
+  allocate(th_auxvars(grid%ngmax))
+  if (option%flow%numerical_derivatives .and. &
+      .not. option%flow%th_freezing) then
+    th_numerical_derivatives = PETSC_TRUE
+  endif
+  do ghosted_id = 1, grid%ngmax
+    call THAuxVarInit(th_auxvars(ghosted_id),option,th_numerical_derivatives)
+  enddo
+  if (th_numerical_derivatives) then
+    allocate(th_min_pert(option%nflowdof))
+    th_min_pert = 0.d0
+    th_min_pert(TH_PRESSURE_DOF) = th_pres_min_pert
+    th_min_pert(TH_TEMPERATURE_DOF) = th_temp_min_pert
+    if (Initialized(th_well_dof)) then
+      th_min_pert(th_well_dof) = th_temp_min_pert
+    endif
+  endif
+
+  if (option%use_sc) then
+    initial_condition => patch%initial_condition_list%first
+    allocate(TH_sec_heat_vars(grid%nlmax))
+
+    tempreal = UNINITIALIZED_DOUBLE
+    do local_id = 1, grid%nlmax
+      ghosted_id = grid%nL2G(local_id)
+      if (patch%imat(ghosted_id) <= 0) cycle
+      call SecondaryHeatAuxVarInit( &
+           patch%material_property_array(patch%imat(ghosted_id))%ptr%multicontinuum, &
+           patch%aux%Material%auxvars(ghosted_id)%secondary_prop%epsilon, &
+           patch%aux%Material%auxvars(ghosted_id)%secondary_prop%half_matrix_width, &
+           patch%aux%Material%auxvars(ghosted_id)%secondary_prop%ncells, &
+           TH_sec_heat_vars(local_id), initial_condition, option)
+    enddo
+
+    patch%aux%SC_heat%sec_heat_vars => TH_sec_heat_vars
+  endif
+
+
+  patch%aux%TH%auxvars => th_auxvars
+  patch%aux%TH%num_aux = grid%ngmax
+
+  ! count the number of boundary connections and allocate
+  ! auxvar data structures for them
+  boundary_condition => patch%boundary_condition_list%first
+
+  sum_connection = 0
+  do
+    if (.not.associated(boundary_condition)) exit
+    sum_connection = sum_connection + &
+                     boundary_condition%connection_set%num_connections
+    boundary_condition => boundary_condition%next
+  enddo
+
+  if (sum_connection > 0) then
+    allocate(th_auxvars_bc(sum_connection))
+    do iconn = 1, sum_connection
+      call THAuxVarInit(th_auxvars_bc(iconn),option,PETSC_FALSE)
+    enddo
+    patch%aux%TH%auxvars_bc => th_auxvars_bc
+  endif
+  patch%aux%TH%num_aux_bc = sum_connection
+
+  ! Create aux vars for source/sink
+  sum_connection = CouplerGetNumConnectionsInList(patch%source_sink_list)
+  if (sum_connection > 0) then
+    allocate(th_auxvars_ss(sum_connection))
+    do iconn = 1, sum_connection
+      call THAuxVarInit(th_auxvars_ss(iconn),option,PETSC_FALSE)
+    enddo
+    patch%aux%TH%auxvars_ss => th_auxvars_ss
+  endif
+  patch%aux%TH%num_aux_ss = sum_connection
+
+  ! initialize parameters
+  cur_fluid_property => realization%fluid_properties
+  do
+    if (.not.associated(cur_fluid_property)) exit
+    iphase = cur_fluid_property%phase_id
+    cur_fluid_property => cur_fluid_property%next
+  enddo
+
+  allocate(dof_is_active(option%nflowdof))
+  dof_is_active = PETSC_TRUE
+ ! if (Initialized(th_well_dof)) then
+ !   dof_is_active(th_well_dof) = PETSC_FALSE
+ ! endif
+  call PatchCreateZeroArray(patch,dof_is_active, &
+                            patch%aux%TH%matrix_zeroing,option)
+  deallocate(dof_is_active)
+
+  ! ensure that prescribed_conditions are solely DIRICHLET type
+  cur_coupler => patch%prescribed_condition_list%first
+  do
+    if (.not.associated(cur_coupler)) exit
+    select case(cur_coupler%flow_condition%pressure%itype)
+      case(DIRICHLET_BC,DIRICHLET_SEEPAGE_BC,DIRICHLET_CONDUCTANCE_BC, &
+           HYDROSTATIC_BC,HYDROSTATIC_SEEPAGE_BC,HYDROSTATIC_CONDUCTANCE_BC)
+      case default
+        option%io_buffer = 'FLOW_CONDITION "' // &
+          trim(cur_coupler%flow_condition%name) // '" PRESSURE TYPE (' // &
+          StringWrite(cur_coupler%flow_condition%pressure%itype) // &
+          ') not supported in TH PRESCRIBED_CONDITION "' // &
+          cur_coupler%name // '".'
+        call PrintErrMsg(option)
+    end select
+    select case(cur_coupler%flow_condition%temperature%itype)
+      case(DIRICHLET_BC)
+      case default
+        option%io_buffer = 'FLOW_CONDITION "' // &
+          trim(cur_coupler%flow_condition%name) // '" TEMPERATURE TYPE (' // &
+          StringWrite(cur_coupler%flow_condition%temperature%itype) // &
+          ') not supported in TH PRESCRIBED_CONDITION "' // &
+          cur_coupler%name // '".'
+        call PrintErrMsg(option)
+    end select
+    cur_coupler => cur_coupler%next
+  enddo
+
+  list => realization%output_option%output_snap_variable_list
+  call THSetPlotVariables(realization,list)
+  list => realization%output_option%output_obs_variable_list
+  call THSetPlotVariables(realization,list)
+
+  if (associated(pm_well)) then
+    call THWellSetup(pm_well,realization)
+  endif
+
+  th_ts_count = 0
+  th_ts_cut_count = 0
+  th_ni_count = 0
+
+end subroutine THSetup
+
+! ************************************************************************** !
+
+subroutine THComputeMassBalance(realization, mass_balance, energy_balance)
+  !
+  ! THomputeMassBalance:
+  ! Adapted from RichardsComputeMassBalance: need to be checked
+  !
+  ! Author: Jitendra Kumar
+  ! Date: 07/21/2010
+  !
+
+  use Realization_Subsurface_class
+  use Patch_module
+  use Option_module
+  use Field_module
+  use Grid_module
+  use Material_Aux_module, only : material_auxvar_type
+
+  implicit none
+
+  class(realization_subsurface_type) :: realization
+  PetscReal :: mass_balance
+  PetscReal :: energy_balance
+
+  type(option_type), pointer :: option
+  type(patch_type), pointer :: patch
+  type(field_type), pointer :: field
+  type(grid_type), pointer :: grid
+  type(global_auxvar_type), pointer :: global_auxvars(:)
+  type(material_auxvar_type), pointer :: material_auxvars(:)
+  type(th_auxvar_type), pointer :: th_auxvars(:)
+  type(th_parameter_type), pointer :: th_parameter
+
+  PetscInt :: local_id
+  PetscInt :: ghosted_id
+  PetscReal :: mass_kmol
+
+  option => realization%option
+  patch => realization%patch
+  grid => patch%grid
+  field => realization%field
+
+  global_auxvars => patch%aux%Global%auxvars
+  material_auxvars => patch%aux%Material%auxvars
+  th_auxvars => patch%aux%TH%auxvars
+  th_parameter => patch%aux%TH%th_parameter
+
+  mass_balance = 0.d0
+  energy_balance = 0.d0
+
+  do local_id = 1, grid%nlmax
+    ghosted_id = grid%nL2G(local_id)
+    if (patch%imat(ghosted_id) <= 0) cycle
+
+    ! [kmol water]
+    mass_kmol = th_auxvars(ghosted_id)%den * &
+                th_auxvars(ghosted_id)%sat * &
+                th_auxvars(ghosted_id)%effective_porosity * &
+                material_auxvars(ghosted_id)%volume
+
+    ! [kg water]
+    mass_balance = mass_balance + mass_kmol * FMWH2O
+
+    ! [MJ]
+    energy_balance = energy_balance + &
+      mass_kmol * th_auxvars(ghosted_id)%u + &  ! u units [MJ/kmol water]
+      (1.d0 - th_auxvars(ghosted_id)%effective_porosity) * &
+      material_auxvars(ghosted_id)%volume * &
+      th_parameter%dencpr(patch%cct_id(ghosted_id)) * &
+      th_auxvars(ghosted_id)%temp
+
+    if (option%flow%th_freezing) then
+      ! mass = volume*saturation_ice*density_ice
+      mass_balance = mass_balance + &
+        th_auxvars(ghosted_id)%ice%den_ice*FMWH2O* &
+        th_auxvars(ghosted_id)%ice%sat_ice* &
+        th_auxvars(ghosted_id)%effective_porosity* &
+        material_auxvars(ghosted_id)%volume
+      option%io_buffer = 'THComputeMassBalance must be verified for ice &
+        &mass balance,'
+      call PrintErrMsg(option)
+    endif
+
+  enddo
+
+end subroutine THComputeMassBalance
+
+! ************************************************************************** !
+
+subroutine THZeroMassBal(realization)
+  !
+  ! Zeros mass balance delta array
+  !
+  ! Author: Satish Karra, LANL
+  ! Date: 12/13/11
+  !
+
+  use Realization_Subsurface_class
+  use Option_module
+  use Patch_module
+  use Grid_module
+
+  implicit none
+
+  class(realization_subsurface_type) :: realization
+
+  type(option_type), pointer :: option
+  type(patch_type), pointer :: patch
+  type(global_auxvar_type), pointer :: global_auxvars_bc(:)
+  type(global_auxvar_type), pointer :: global_auxvars_ss(:)
+
+  PetscInt :: iconn
+
+  option => realization%option
+  patch => realization%patch
+
+  global_auxvars_bc => patch%aux%Global%auxvars_bc
+  global_auxvars_ss => patch%aux%Global%auxvars_ss
+
+#ifdef COMPUTE_INTERNAL_MASS_FLUX
+  do iconn = 1, patch%aux%TH%num_aux
+    patch%aux%Global%auxvars(iconn)%mass_balance_delta = 0.d0
+  enddo
+#endif
+
+  ! Intel 10.1 on Chinook reports a SEGV if this conditional is not
+  ! placed around the internal do loop - geh
+  if (patch%aux%TH%num_aux_bc > 0) then
+    do iconn = 1, patch%aux%TH%num_aux_bc
+      global_auxvars_bc(iconn)%mass_balance_delta = 0.d0
+    enddo
+  endif
+  if (patch%aux%TH%num_aux_ss > 0) then
+    do iconn = 1, patch%aux%TH%num_aux_ss
+      global_auxvars_ss(iconn)%mass_balance_delta = 0.d0
+    enddo
+  endif
+
+end subroutine THZeroMassBal
+
+! ************************************************************************** !
+
+subroutine THUpdateMassBalance(realization)
+  !
+  ! Updates mass balance
+  !
+  ! Author: ???
+  ! Date: 12/13/11
+  !
+
+  use Realization_Subsurface_class
+  use Option_module
+  use Patch_module
+  use Grid_module
+
+  implicit none
+
+  class(realization_subsurface_type) :: realization
+
+  type(option_type), pointer :: option
+  type(patch_type), pointer :: patch
+  type(global_auxvar_type), pointer :: global_auxvars_bc(:)
+  type(global_auxvar_type), pointer :: global_auxvars_ss(:)
+
+  PetscInt :: iconn
+
+  option => realization%option
+  patch => realization%patch
+
+  global_auxvars_bc => patch%aux%Global%auxvars_bc
+  global_auxvars_ss => patch%aux%Global%auxvars_ss
+
+#ifdef COMPUTE_INTERNAL_MASS_FLUX
+  do iconn = 1, patch%aux%TH%num_aux
+    patch%aux%Global%auxvars(iconn)%mass_balance = &
+      patch%aux%Global%auxvars(iconn)%mass_balance + &
+      patch%aux%Global%auxvars(iconn)%mass_balance_delta*FMWH2O* &
+      option%flow_dt
+  enddo
+#endif
+
+  if (patch%aux%TH%num_aux_bc > 0) then
+    do iconn = 1, patch%aux%TH%num_aux_bc
+      global_auxvars_bc(iconn)%mass_balance = &
+        global_auxvars_bc(iconn)%mass_balance + &
+        global_auxvars_bc(iconn)%mass_balance_delta*FMWH2O*option%flow_dt
+    enddo
+  endif
+  if (patch%aux%TH%num_aux_ss > 0) then
+    do iconn = 1, patch%aux%TH%num_aux_ss
+      global_auxvars_ss(iconn)%mass_balance = &
+        global_auxvars_ss(iconn)%mass_balance + &
+        global_auxvars_ss(iconn)%mass_balance_delta*FMWH2O*option%flow_dt
+    enddo
+  endif
+
+end subroutine THUpdateMassBalance
+
+! ************************************************************************** !
+
+subroutine THUpdateAuxVars(realization,pm_well)
+  !
+  ! Updates the auxiliary variables associated with
+  ! the TH problem
+  !
+  ! Author: ???
+  ! Date: 12/10/07
+  !
+
+  use Realization_Subsurface_class
+  use Patch_module
+  use Option_module
+  use Field_module
+  use Grid_module
+  use Coupler_module
+  use Connection_module
+  use Material_module
+  use PM_Well_class
+
+  implicit none
+
+  class(realization_subsurface_type) :: realization
+  class(pm_well_type), pointer :: pm_well
+
+  type(option_type), pointer :: option
+  type(patch_type), pointer :: patch
+  type(grid_type), pointer :: grid
+  type(field_type), pointer :: field
+  type(coupler_type), pointer :: boundary_condition
+  type(coupler_type), pointer :: source_sink
+  type(connection_set_type), pointer :: cur_connection_set
+  type(th_auxvar_type), pointer :: th_auxvars(:)
+  type(th_auxvar_type), pointer :: th_auxvars_bc(:)
+  type(th_auxvar_type), pointer :: th_auxvars_ss(:)
+  type(th_well_auxvar_type), pointer :: th_well_auxvars(:)
+  type(th_well_auxvar_type), pointer :: th_well_auxvars_bc(:)
+  type(global_auxvar_type), pointer :: global_auxvars(:)
+  type(global_auxvar_type), pointer :: global_auxvars_bc(:)
+  type(global_auxvar_type), pointer :: global_auxvars_ss(:)
+  type(material_auxvar_type), pointer :: material_auxvars(:)
+  type(th_parameter_type), pointer :: th_parameter
+
+  PetscInt :: ghosted_id, local_id, istart, iend, sum_connection, idof, iconn
+  PetscInt :: iphasebc, iphase
+  PetscReal, pointer :: xx_loc_p(:)
+  PetscReal :: xxbc(realization%option%nflowdof)
+  PetscReal, pointer :: xx(:)
+  PetscReal :: tsrc1
+  PetscErrorCode :: ierr
+  PetscInt :: icct
+
+  !!
+!  PetscReal, allocatable :: gradient(:,:)
+  !!
+
+  option => realization%option
+  patch => realization%patch
+  grid => patch%grid
+  field => realization%field
+
+  !!
+!  allocate(gradient(grid%ngmax,3))
+!  gradient = 0.d0
+  !!
+
+  th_auxvars => patch%aux%TH%auxvars
+  th_auxvars_bc => patch%aux%TH%auxvars_bc
+  th_auxvars_ss => patch%aux%TH%auxvars_ss
+  th_well_auxvars => patch%aux%TH%auxvars_well
+  th_well_auxvars_bc => patch%aux%TH%auxvars_well_bc
+  global_auxvars => patch%aux%Global%auxvars
+  global_auxvars_bc => patch%aux%Global%auxvars_bc
+  global_auxvars_ss => patch%aux%Global%auxvars_ss
+  material_auxvars => patch%aux%Material%auxvars
+  th_parameter => patch%aux%TH%th_parameter
+
+  call VecGetArray(field%flow_xx_loc,xx_loc_p,ierr);CHKERRQ(ierr)
+
+  do ghosted_id = 1, grid%ngmax
+    if (grid%nG2L(ghosted_id) < 0) cycle ! bypass ghosted corner cells
+
+    if (patch%imat(ghosted_id) <= 0) cycle
+    iend = ghosted_id*option%nflowdof
+    istart = iend-option%nflowdof+1
+    iphase = global_auxvars(ghosted_id)%istate
+    icct = patch%cct_id(ghosted_id)
+
+    if (option%flow%th_freezing) then
+       call THAuxVarComputeFreezing(xx_loc_p(istart:iend), &
+            th_auxvars(ghosted_id),global_auxvars(ghosted_id), &
+            material_auxvars(ghosted_id), &
+            iphase, &
+            patch%saturation_function_array(patch%cc_id(ghosted_id))%ptr, &
+            patch%char_curves_thermal_array(patch%cct_id(ghosted_id))%ptr, &
+            th_parameter, icct, &
+            grid%nG2A(ghosted_id),PETSC_TRUE,option)
+    else
+       call THAuxVarComputeNoFreezing(xx_loc_p(istart:iend), &
+            th_auxvars(ghosted_id),global_auxvars(ghosted_id), &
+            material_auxvars(ghosted_id), &
+            iphase, &
+            patch%characteristic_curves_array(patch%cc_id(ghosted_id))%ptr, &
+            patch%char_curves_thermal_array(patch%cct_id(ghosted_id))%ptr, &
+            th_parameter, icct, &
+            grid%nG2A(ghosted_id),PETSC_TRUE,option)
+    endif
+
+    global_auxvars(ghosted_id)%istate = iphase
+  enddo
+
+  boundary_condition => patch%boundary_condition_list%first
+  sum_connection = 0
+  do
+    if (.not.associated(boundary_condition)) exit
+    cur_connection_set => boundary_condition%connection_set
+    do iconn = 1, cur_connection_set%num_connections
+      sum_connection = sum_connection + 1
+      local_id = cur_connection_set%id_dn(iconn)
+      ghosted_id = grid%nL2G(local_id)
+      if (patch%imat(ghosted_id) <= 0) cycle
+      icct = patch%cct_id(ghosted_id)
+
+      do idof=1,option%nflowdof
+        select case(boundary_condition%flow_condition%itype(idof))
+          case(DIRICHLET_BC,DIRICHLET_SEEPAGE_BC,DIRICHLET_CONDUCTANCE_BC, &
+               HYDROSTATIC_BC,HYDROSTATIC_SEEPAGE_BC, &
+               HYDROSTATIC_CONDUCTANCE_BC, &
+               HET_SURF_HYDROSTATIC_SEEPAGE_BC, &
+               HET_DIRICHLET_BC,HET_HYDROSTATIC_SEEPAGE_BC, &
+               HET_HYDROSTATIC_CONDUCTANCE_BC)
+            xxbc(idof) = boundary_condition%flow_aux_real_var(idof,iconn)
+          case(NEUMANN_BC,ZERO_GRADIENT_BC)
+            xxbc(idof) = xx_loc_p((ghosted_id-1)*option%nflowdof+idof)
+        end select
+      enddo
+
+      select case(boundary_condition%flow_condition%itype(TH_PRESSURE_DOF))
+        case(DIRICHLET_BC,DIRICHLET_SEEPAGE_BC,DIRICHLET_CONDUCTANCE_BC, &
+             HYDROSTATIC_BC,HYDROSTATIC_SEEPAGE_BC,HYDROSTATIC_CONDUCTANCE_BC, &
+             HET_DIRICHLET_BC,HET_HYDROSTATIC_SEEPAGE_BC, &
+             HET_HYDROSTATIC_CONDUCTANCE_BC)
+          iphasebc = boundary_condition%flow_aux_int_var(1,iconn)
+        case(NEUMANN_BC,ZERO_GRADIENT_BC)
+          iphasebc = global_auxvars(ghosted_id)%istate
+      end select
+      option%iflag = TH_UPDATE_FOR_BOUNDARY
+      if (option%flow%th_freezing) then
+         call THAuxVarComputeFreezing(xxbc,th_auxvars_bc(sum_connection), &
+                                      global_auxvars_bc(sum_connection), &
+              material_auxvars(ghosted_id), &
+              iphasebc, &
+              patch%saturation_function_array(patch%cc_id(ghosted_id))%ptr, &
+              patch%char_curves_thermal_array(patch%cct_id(ghosted_id))%ptr, &
+              th_parameter, icct, &
+              -grid%nG2A(ghosted_id),PETSC_FALSE,option)
+      else
+         call THAuxVarComputeNoFreezing(xxbc,th_auxvars_bc(sum_connection), &
+              global_auxvars_bc(sum_connection), &
+              material_auxvars(ghosted_id), &
+              iphasebc, &
+              patch%characteristic_curves_array(patch%cc_id(ghosted_id))%ptr, &
+              patch%char_curves_thermal_array(patch%cct_id(ghosted_id))%ptr, &
+              th_parameter, icct, &
+              -grid%nG2A(ghosted_id),PETSC_FALSE,option)
+      endif
+      option%iflag = UNINITIALIZED_INTEGER
+    enddo
+    boundary_condition => boundary_condition%next
+  enddo
+
+  ! source/sinks
+  source_sink => patch%source_sink_list%first
+  sum_connection = 0
+  allocate(xx(option%nflowdof))
+  do
+    if (.not.associated(source_sink)) exit
+    cur_connection_set => source_sink%connection_set
+    do iconn = 1, cur_connection_set%num_connections
+      sum_connection = sum_connection + 1
+      local_id = cur_connection_set%id_dn(iconn)
+      ghosted_id = grid%nL2G(local_id)
+      if (patch%imat(ghosted_id) <= 0) cycle
+      icct = patch%cct_id(ghosted_id)
+
+      iend = ghosted_id*option%nflowdof
+      istart = iend-option%nflowdof+1
+      iphase = global_auxvars(ghosted_id)%istate
+
+      select case(source_sink%flow_condition%itype(TH_TEMPERATURE_DOF))
+        case (HET_DIRICHLET_BC)
+          tsrc1 = source_sink%flow_aux_real_var(TWO_INTEGER,iconn)
+        case (DIRICHLET_BC)
+          tsrc1 = source_sink%flow_condition%temperature%dataset%rarray(1)
+        case (ENERGY_RATE_SS,SCALED_ENERGY_RATE_SS,HET_ENERGY_RATE_SS, &
+              ZERO_GRADIENT_BC)
+          tsrc1 = xx_loc_p((ghosted_id-1)*option%nflowdof+TH_TEMPERATURE_DOF)
+        case default
+          option%io_buffer='Unsupported temperature flow condtion for ' // &
+            'a source-sink in TH mode: ' // trim(source_sink%name)
+          call PrintErrMsg(option)
+      end select
+
+      xx(TH_PRESSURE_DOF) = xx_loc_p(istart)
+      xx(TH_TEMPERATURE_DOF) = tsrc1
+
+      if (option%flow%th_freezing) then
+         call THAuxVarComputeFreezing(xx, &
+                                      th_auxvars_ss(sum_connection), &
+                                      global_auxvars_ss(sum_connection), &
+                                      material_auxvars(ghosted_id), &
+                                      iphase, &
+                                      patch%saturation_function_array( &
+                                        patch%cc_id(ghosted_id))%ptr, &
+                                      patch%char_curves_thermal_array( &
+                                        patch%cct_id(ghosted_id))%ptr, &
+                                      th_parameter, icct, &
+                                      -grid%nG2A(ghosted_id),PETSC_FALSE,option)
+      else
+         call THAuxVarComputeNoFreezing(xx, &
+                                      th_auxvars_ss(sum_connection), &
+                                      global_auxvars_ss(sum_connection), &
+                                      material_auxvars(ghosted_id), &
+                                      iphase, &
+                                      patch%characteristic_curves_array( &
+                                        patch%cc_id(ghosted_id))%ptr, &
+                                      patch%char_curves_thermal_array( &
+                                        patch%cct_id(ghosted_id))%ptr, &
+                                      th_parameter, icct, &
+                                      -grid%nG2A(ghosted_id),PETSC_FALSE,option)
+      endif
+    enddo
+    source_sink => source_sink%next
+  enddo
+  deallocate(xx)
+
+  call THWellUpdateAuxVars(xx_loc_p,pm_well)
+
+  call VecRestoreArray(field%flow_xx_loc,xx_loc_p,ierr);CHKERRQ(ierr)
+
+  patch%aux%TH%auxvars_up_to_date = PETSC_TRUE
+
+end subroutine THUpdateAuxVars
+
+! ************************************************************************** !
+
+subroutine THInitializeTimestep(realization,pm_well)
+  !
+  ! Update data in module prior to time step
+  !
+  ! Author: ???
+  ! Date: 02/20/08
+  !
+
+  use Realization_Subsurface_class
+  use PM_Well_class
+
+  implicit none
+
+  class(realization_subsurface_type) :: realization
+  class(pm_well_type), pointer :: pm_well
+
+  Mat :: Jdum
+
+  call THUpdateFixedAccumulation(realization)
+  call THWellAccumulationTerms(realization%field%flow_accum_t,Jdum, &
+                               pm_well,PETSC_FALSE)
+
+end subroutine THInitializeTimestep
+
+! ************************************************************************** !
+
+subroutine THUpdateSolution(realization)
+  !
+  ! Updates data in module after a successful time step
+  !
+  ! Author: Satish Karra, LANL
+  ! Date: 12/13/11, 02/28/14
+  !
+
+
+  use Realization_Subsurface_class
+  use Patch_module
+  use Grid_module
+  use Option_module
+  use Field_module
+  use Secondary_Continuum_Aux_module
+  use Secondary_Continuum_module
+
+  implicit none
+
+  class(realization_subsurface_type) :: realization
+  type(grid_type), pointer :: grid
+  type(patch_type), pointer :: patch
+  type(option_type), pointer :: option
+  type(field_type), pointer :: field
+  type(th_parameter_type), pointer :: th_parameter
+  type(th_auxvar_type), pointer :: th_auxvars(:)
+  type(global_auxvar_type), pointer :: global_auxvars(:)
+  type(sec_heat_type), pointer :: TH_sec_heat_vars(:)
+
+  PetscInt :: local_id, ghosted_id
+  ! secondary continuum variables
+  PetscReal :: sec_dencpr
+  PetscInt :: icct
+
+  patch => realization%patch
+  grid => patch%grid
+  option => realization%option
+  field => realization%field
+
+  th_parameter => patch%aux%TH%th_parameter
+  th_auxvars => patch%aux%TH%auxvars
+  global_auxvars => patch%aux%Global%auxvars
+
+  if (option%use_sc) then
+    TH_sec_heat_vars => patch%aux%SC_heat%sec_heat_vars
+  endif
+
+  if (realization%option%compute_mass_balance_new) then
+    call THUpdateMassBalance(realization)
+  endif
+
+  if (option%use_sc) then
+    do local_id = 1, grid%nlmax  ! For each local node do...
+      ghosted_id = grid%nL2G(local_id)
+      if (patch%imat(ghosted_id) <= 0) cycle
+      if (Equal((patch%aux%Material%auxvars(ghosted_id)% &
+          secondary_prop%epsilon),1.d0)) cycle
+
+      ! secondary rho*c_p same as primary for now
+      icct = patch%cct_id(ghosted_id)
+      sec_dencpr = th_parameter%dencpr(icct)
+
+      call SecHeatAuxVarCompute(TH_sec_heat_vars(local_id), &
+                                th_parameter%ckwet(icct), &
+                                sec_dencpr,th_auxvars(ghosted_id)%temp, &
+                                option)
+
+    enddo
+  endif
+
+
+  th_ts_count = th_ts_count + 1
+  th_ts_cut_count = 0
+  th_ni_count = 0
+
+end subroutine THUpdateSolution
+
+! ************************************************************************** !
+
+subroutine THUpdateFixedAccumulation(realization)
+  !
+  ! Updates the fixed portion of the accumulation term
+  !
+  ! Author: ???
+  ! Date: 12/10/07
+  !
+
+  use Realization_Subsurface_class
+  use Patch_module
+  use Option_module
+  use Field_module
+  use Grid_module
+
+  implicit none
+
+  class(realization_subsurface_type) :: realization
+
+  type(option_type), pointer :: option
+  type(patch_type), pointer :: patch
+  type(grid_type), pointer :: grid
+  type(field_type), pointer :: field
+  type(global_auxvar_type), pointer :: global_auxvars(:)
+  type(th_auxvar_type), pointer :: th_auxvars(:)
+  type(th_parameter_type), pointer :: th_parameter
+  type(material_auxvar_type), pointer :: material_auxvars(:)
+
+  PetscInt :: ghosted_id, local_id, istart, iend, iphase
+  PetscReal, pointer :: xx_p(:)
+  PetscReal, pointer :: accum_t_p(:)
+  PetscReal :: vol_frac_prim
+  PetscInt :: icct
+
+  PetscErrorCode :: ierr
+
+  option => realization%option
+  field => realization%field
+  patch => realization%patch
+  grid => patch%grid
+
+  th_parameter => patch%aux%TH%th_parameter
+  th_auxvars => patch%aux%TH%auxvars
+  global_auxvars => patch%aux%Global%auxvars
+  material_auxvars => patch%aux%Material%auxvars
+
+  call VecGetArrayRead(field%flow_xx,xx_p,ierr);CHKERRQ(ierr)
+
+  call VecGetArray(field%flow_accum_t,accum_t_p,ierr);CHKERRQ(ierr)
+
+  vol_frac_prim = 1.d0
+
+  do local_id = 1, grid%nlmax
+    ghosted_id = grid%nL2G(local_id)
+    if (patch%imat(ghosted_id) <= 0) cycle
+
+    iend = local_id*option%nflowdof
+    istart = iend-option%nflowdof+1
+    iphase = global_auxvars(ghosted_id)%istate
+    icct = patch%cct_id(ghosted_id)
+
+    if (option%flow%th_freezing) then
+       call THAuxVarComputeFreezing(xx_p(istart:iend), &
+            th_auxvars(ghosted_id),global_auxvars(ghosted_id), &
+            material_auxvars(ghosted_id), &
+            iphase, &
+            patch%saturation_function_array(patch%cc_id(ghosted_id))%ptr, &
+            patch%char_curves_thermal_array(patch%cct_id(ghosted_id))%ptr, &
+            th_parameter, icct, &
+            grid%nG2A(ghosted_id),PETSC_TRUE,option)
+    else
+       option%iflag = TH_UPDATE_FOR_FIXED_ACCUM
+       call THAuxVarComputeNoFreezing(xx_p(istart:iend), &
+            th_auxvars(ghosted_id),global_auxvars(ghosted_id), &
+            material_auxvars(ghosted_id), &
+            iphase, &
+            patch%characteristic_curves_array(patch%cc_id(ghosted_id))%ptr, &
+            patch%char_curves_thermal_array(patch%cct_id(ghosted_id))%ptr, &
+            th_parameter, icct, &
+            grid%nG2A(ghosted_id),PETSC_TRUE,option)
+    endif
+
+
+    if (option%use_sc) then
+      vol_frac_prim = material_auxvars(ghosted_id)%secondary_prop%epsilon
+    endif
+
+    global_auxvars(ghosted_id)%istate = iphase
+    option%iflag = TH_UPDATE_FOR_FIXED_ACCUM
+    call THAccumulation(th_auxvars(ghosted_id),global_auxvars(ghosted_id), &
+                        material_auxvars(ghosted_id), &
+                        th_parameter, &
+                        th_parameter%dencpr(patch%cct_id(ghosted_id)), &
+                        option,vol_frac_prim,accum_t_p(istart:iend))
+  enddo
+
+  call VecRestoreArrayRead(field%flow_xx,xx_p,ierr);CHKERRQ(ierr)
+
+  call VecRestoreArray(field%flow_accum_t,accum_t_p,ierr);CHKERRQ(ierr)
+
+#if 0
+   call THNumericalJacobianTest(field%flow_xx,J,realization,pm_well)
+#endif
+
+end subroutine THUpdateFixedAccumulation
+
+! ************************************************************************** !
+
+subroutine THNumericalJacobianTest(xx,A_orig,realization,pm_well,debug)
+  !
+  ! Computes the a test numerical jacobian
+  !
+  ! Author: ???
+  ! Date: 12/13/07
+  !
+
+  use Realization_Subsurface_class
+  use Patch_module
+  use Option_module
+  use Grid_module
+  use Field_module
+  use PM_Well_class
+  use Debug_module
+
+  implicit none
+
+  Vec :: xx
+  Mat :: A_orig
+  class(realization_subsurface_type) :: realization
+  class(pm_well_type), pointer :: pm_well
+ type(debug_type) :: debug
+
+  Vec :: xx_pert
+  Vec :: res
+  Vec :: res_pert
+  Mat :: A
+  PetscErrorCode :: ierr
+
+  PetscReal :: derivative, perturbation
+
+  PetscReal, pointer :: vec_p(:), vec2_p(:)
+
+  type(grid_type), pointer :: grid
+  type(option_type), pointer :: option
+  type(patch_type), pointer :: patch
+  type(field_type), pointer :: field
+
+  PetscInt :: idof, idof2, icell
+
+  patch => realization%patch
+  grid => patch%grid
+  option => realization%option
+  field => realization%field
+
+  call VecDuplicate(xx,xx_pert,ierr);CHKERRQ(ierr)
+  call VecDuplicate(xx,res,ierr);CHKERRQ(ierr)
+  call VecDuplicate(xx,res_pert,ierr);CHKERRQ(ierr)
+
+  call MatDuplicate(A_orig,MAT_SHARE_NONZERO_PATTERN,A,ierr);CHKERRQ(ierr)
+  call MatZeroEntries(A,ierr);CHKERRQ(ierr)
+!  call MatCreate(option%mycomm,A,ierr);CHKERRQ(ierr)
+!  call MatSetSizes(A,PETSC_DECIDE,PETSC_DECIDE,grid%nlmax*option%nflowdof, &
+!                   grid%nlmax*option%nflowdof,ierr);CHKERRQ(ierr)
+!  call MatSetType(A,MATAIJ,ierr);CHKERRQ(ierr)
+!  call MatSetFromOptions(A,ierr);CHKERRQ(ierr)
+
+  call THResidual(PETSC_NULL_SNES,xx,res,realization,pm_well,debug,ierr)
+  call VecGetArray(res,vec2_p,ierr);CHKERRQ(ierr)
+  do icell = 1,grid%nlmax
+    if (patch%imat(icell) <= 0) cycle
+    do idof = (icell-1)*option%nflowdof+1,icell*option%nflowdof
+      call VecCopy(xx,xx_pert,ierr);CHKERRQ(ierr)
+      call VecGetArray(xx_pert,vec_p,ierr);CHKERRQ(ierr)
+      perturbation = vec_p(idof)*perturbation_tolerance
+      vec_p(idof) = vec_p(idof)+perturbation
+      call VecRestoreArray(xx_pert,vec_p,ierr);CHKERRQ(ierr)
+      call THResidual(PETSC_NULL_SNES,xx_pert,res_pert,realization, &
+                      pm_well,debug,ierr)
+      call VecGetArray(res_pert,vec_p,ierr);CHKERRQ(ierr)
+      do idof2 = 1, grid%nlmax*option%nflowdof
+        derivative = (vec_p(idof2)-vec2_p(idof2))/perturbation
+        if (dabs(derivative) > 1.d-30) then
+          call matsetvalue(a,idof2-1,idof-1,derivative,insert_values, &
+                           ierr);CHKERRQ(ierr)
+        endif
+      enddo
+      call VecRestoreArray(res_pert,vec_p,ierr);CHKERRQ(ierr)
+    enddo
+  enddo
+  call VecRestoreArray(res,vec2_p,ierr);CHKERRQ(ierr)
+
+  call MatAssemblyBegin(A,MAT_FINAL_ASSEMBLY,ierr);CHKERRQ(ierr)
+  call MatAssemblyEnd(A,MAT_FINAL_ASSEMBLY,ierr);CHKERRQ(ierr)
+  call DebugMatView(debug,A,'numerical_jacobian.out',option)
+
+  call MatDestroy(A,ierr);CHKERRQ(ierr)
+
+  call VecDestroy(xx_pert,ierr);CHKERRQ(ierr)
+  call VecDestroy(res,ierr);CHKERRQ(ierr)
+  call VecDestroy(res_pert,ierr);CHKERRQ(ierr)
+
+end subroutine THNumericalJacobianTest
+
+! ************************************************************************** !
+
+subroutine THAccumDerivative(th_auxvar,global_auxvar, &
+                             material_auxvar, &
+                             th_parameter, &
+                             rock_dencpr, &
+                             icct, &
+                             option,sat_func, &
+                             characteristic_curves, &
+                             thermal_cc, &
+                             vol_frac_prim,J)
+  !
+  ! Computes derivatives of the accumulation
+  ! term for the Jacobian
+  !
+  ! Author: ???
+  ! Date: 12/13/07
+  !
+
+  use Option_module
+  use Characteristic_Curves_module
+  use Characteristic_Curves_Thermal_module
+  use Saturation_Function_module
+  use Material_Aux_module, only : material_auxvar_type
+  use EOS_Water_module
+  use Geomechanics_Linear_Aux_module
+
+  implicit none
+
+  type(th_auxvar_type) :: th_auxvar
+  type(global_auxvar_type) :: global_auxvar
+  type(material_auxvar_type) :: material_auxvar
+  type(option_type) :: option
+  type(th_parameter_type) :: th_parameter
+  PetscReal :: rock_dencpr
+  PetscInt :: icct
+  class(characteristic_curves_type), pointer :: characteristic_curves
+  class(cc_thermal_type) :: thermal_cc
+  type(saturation_function_type), pointer :: sat_func
+  PetscReal :: J(option%nflowdof,option%nflowdof)
+
+  PetscReal :: vol
+  PetscReal :: por
+  PetscReal :: porXvol
+
+  PetscInt :: iphase, ideriv
+  type(th_auxvar_type) :: th_auxvar_pert
+  type(global_auxvar_type) :: global_auxvar_pert
+  ! leave as type
+  type(material_auxvar_type) :: material_auxvar_pert
+  PetscReal :: x(option%nflowdof), x_pert(option%nflowdof), pert
+  PetscReal :: res(option%nflowdof), res_pert(option%nflowdof)
+  PetscReal :: J_pert(option%nflowdof,option%nflowdof)
+  PetscReal :: vol_frac_prim
+  PetscReal :: dcompressed_porosity_dp
+
+  PetscReal :: pres, temp
+  PetscReal :: sat, dsat_dp, dsat_dT
+  PetscReal :: den, dden_dp, dden_dT
+  PetscReal :: u, du_dp, du_dT
+
+  ! ice variables
+  PetscReal :: sat_g, den_g, mol_g, u_g
+  PetscReal :: ddeng_dT, dmolg_dT, dsatg_dp, dsatg_dT, dug_dT
+  PetscReal :: sat_i, den_i, u_i
+  PetscReal :: dsati_dp, dsati_dT
+  PetscReal :: ddeni_dp, ddeni_dT
+  PetscReal :: dui_dT
+  PetscInt :: idof, ieq
+  PetscReal :: dpor_dT
+
+  J = 0.d0
+  if (th_numerical_derivatives) then
+    call THAccumulation(th_auxvar,global_auxvar,material_auxvar, &
+                        th_parameter, &
+                        rock_dencpr,option,vol_frac_prim,res)
+    do idof = 1, option%nflowdof
+      call THAccumulation(th_auxvar%auxvar_pert(idof),global_auxvar, &
+                          material_auxvar, &
+                          th_parameter, &
+                          rock_dencpr,option,vol_frac_prim,res_pert)
+      do ieq = 1, option%nflowdof
+        J(ieq,idof) = (res_pert(ieq)-res(ieq)) / &
+                      th_auxvar%auxvar_pert(idof)%pert
+      enddo
+    enddo
+    return
+  endif
+
+  ! X = {p, T}; R = {R_p, R_T}
+
+  vol = material_auxvar%volume
+  pres = th_auxvar%pres
+  temp = th_auxvar%temp
+  sat = th_auxvar%sat
+  den = th_auxvar%den
+  dden_dp = th_auxvar%dden_dp
+  dden_dT = th_auxvar%dden_dT
+  dsat_dp = th_auxvar%dsat_dp
+  dsat_dT = th_auxvar%dsat_dT
+  u = th_auxvar%u
+  du_dT = th_auxvar%du_dT
+  du_dp = th_auxvar%du_dp
+
+  por = th_auxvar%effective_porosity
+  dcompressed_porosity_dp = th_auxvar%dpor_dp
+  dpor_dT = th_auxvar%dpor_dT
+
+  porXvol = por*vol
+
+  ! d(por*sat*den)/dP * vol
+  J(TH_LIQUID_EQUATION_INDEX,TH_PRESSURE_DOF) = &
+    (sat*dden_dp + dsat_dp*den)*porXvol + &
+    dcompressed_porosity_dp*sat*den*vol
+
+  J(TH_LIQUID_EQUATION_INDEX,TH_TEMPERATURE_DOF) = sat*dden_dT*porXvol + &
+                                          sat*den*dpor_dT*vol
+  J(TH_ENERGY_EQUATION_INDEX,TH_PRESSURE_DOF) = (dsat_dp*den*u + &
+                                           sat*dden_dp*u + &
+                                           sat*den*du_dp)*porXvol + &
+                                           (den*sat*u - rock_dencpr*temp)* &
+                                           vol*dcompressed_porosity_dp
+  J(TH_ENERGY_EQUATION_INDEX,TH_TEMPERATURE_DOF) = &
+            sat*(dden_dT*u + den*du_dT)*porXvol + (1.d0 - por)*vol*rock_dencpr + &
+            sat*den*u*dpor_dT*vol - dpor_dT*vol*rock_dencpr*temp
+
+  if (option%flow%th_freezing) then
+     ! SK, 11/17/11
+     sat_g    = th_auxvar%ice%sat_gas
+     sat_i    = th_auxvar%ice%sat_ice
+     dsati_dT = th_auxvar%ice%dsat_ice_dT
+     dsati_dp = th_auxvar%ice%dsat_ice_dp
+     dsatg_dp = th_auxvar%ice%dsat_gas_dp
+     dsatg_dT = th_auxvar%ice%dsat_gas_dT
+
+     u_g      = th_auxvar%ice%u_gas
+     u_i      = th_auxvar%ice%u_ice
+     dug_dT   = th_auxvar%ice%du_gas_dT
+     dui_dT   = th_auxvar%ice%du_ice_dT
+
+     den_i    = th_auxvar%ice%den_ice
+     den_g    = th_auxvar%ice%den_gas
+     mol_g    = th_auxvar%ice%mol_gas
+     ddeni_dT = th_auxvar%ice%dden_ice_dT
+     ddeni_dp = th_auxvar%ice%dden_ice_dp
+     ddeng_dT = th_auxvar%ice%dden_gas_dT
+     dmolg_dT = th_auxvar%ice%dmol_gas_dT
+
+     J(TH_LIQUID_EQUATION_INDEX,TH_PRESSURE_DOF) = &
+       J(TH_LIQUID_EQUATION_INDEX,TH_PRESSURE_DOF) + &
+                                          (dsatg_dp*den_g*mol_g + &
+                                           dsati_dp*den_i       + &
+                                           sat_i   *ddeni_dp     )*porXvol + &
+                                          (sat_g   *den_g*mol_g + &
+                                           sat_i   *den_i        )* &
+                                          dcompressed_porosity_dp*vol
+
+     J(TH_LIQUID_EQUATION_INDEX,TH_TEMPERATURE_DOF) = &
+       J(TH_LIQUID_EQUATION_INDEX,TH_TEMPERATURE_DOF) + &
+                            (th_auxvar%dsat_dT*th_auxvar%den + &
+                             dsatg_dT * den_g    * mol_g            + &
+                             sat_g    * ddeng_dT * mol_g            + &
+                             sat_g    * den_g    * dmolg_dT         + &
+                             dsati_dT * den_i                       + &
+                             sat_i    * ddeni_dT                    )*porXvol
+
+     J(TH_ENERGY_EQUATION_INDEX,TH_PRESSURE_DOF) = &
+       J(TH_ENERGY_EQUATION_INDEX,TH_PRESSURE_DOF) + &
+                     (dsatg_dp * den_g    * u_g + &
+                      dsati_dp * den_i    * u_i + &
+                      sat_i    * ddeni_dp * u_i )*porXvol + &
+                     (sat_g    * den_g    * u_g + &
+                      sat_i    * den_i    * u_i )*dcompressed_porosity_dp*vol
+
+     J(TH_ENERGY_EQUATION_INDEX,TH_TEMPERATURE_DOF) = &
+       J(TH_ENERGY_EQUATION_INDEX,TH_TEMPERATURE_DOF) + &
+                (th_auxvar%dsat_dT*th_auxvar%den*th_auxvar%u + &
+                  dsatg_dT * den_g    * u_g                         + &
+                  sat_g    * ddeng_dT * u_g                         + &
+                  sat_g    * den_g    * dug_dT                      + &
+                  dsati_dT * den_i    * u_i                         + &
+                  sat_i    * ddeni_dT * u_i                         + &
+                  sat_i    * den_i    * dui_dT                      )*porXvol
+  endif
+
+  J = J/option%flow_dt
+  J(TH_ENERGY_EQUATION_INDEX,:) = vol_frac_prim*J(TH_ENERGY_EQUATION_INDEX,:)
+
+  ! If only solving the energy equation,
+  !  - Set jacobian term corresponding to mass-equation to zero, and
+  !  - Set off-diagonal jacobian terms to zero.
+  if (option%flow%only_energy_eq) then
+    J(TH_LIQUID_EQUATION_INDEX,TH_PRESSURE_DOF) = 1.d0
+    J(TH_LIQUID_EQUATION_INDEX,TH_TEMPERATURE_DOF) = 0.d0
+    J(TH_ENERGY_EQUATION_INDEX,TH_PRESSURE_DOF) = 0.d0
+  endif
+
+  if (option%flow%numerical_derivatives) then
+    call GlobalAuxVarInit(global_auxvar_pert,option)
+    call MaterialAuxVarInit(material_auxvar_pert,option)
+
+    call THAuxVarCopy(th_auxvar,th_auxvar_pert,option)
+    call GlobalAuxVarCopy(global_auxvar,global_auxvar_pert,option)
+    call MaterialAuxVarCopy(material_auxvar,material_auxvar_pert,option)
+
+    x(TH_PRESSURE_DOF) = th_auxvar%pres
+    x(TH_TEMPERATURE_DOF) = th_auxvar%temp
+
+    call THAccumulation(th_auxvar,global_auxvar,material_auxvar, &
+                        th_parameter, &
+                        rock_dencpr,option, &
+                        vol_frac_prim,res)
+
+    do ideriv = 1,option%nflowdof
+      pert = x(ideriv)*perturbation_tolerance
+      x_pert = x
+      if (option%flow%th_freezing) then
+         if (ideriv == 1) then
+            if (x_pert(ideriv) < option%flow%reference_pressure) then
+               pert = - pert
+            endif
+            x_pert(ideriv) = x_pert(ideriv) + pert
+         endif
+
+         if (ideriv == 2) then
+            if (x_pert(ideriv) < 0.d0) then
+               pert = - 1.d-8
+            else
+               pert =  1.d-8
+            endif
+            x_pert(ideriv) = x_pert(ideriv) + pert
+         endif
+      else
+         x_pert(ideriv) = x_pert(ideriv) + pert
+      endif
+
+      if (option%flow%th_freezing) then
+         call THAuxVarComputeFreezing(x_pert,th_auxvar_pert, &
+                                 global_auxvar_pert,material_auxvar_pert, &
+                                 iphase,sat_func,thermal_cc, &
+                                 th_parameter, icct, &
+                                 -999,PETSC_TRUE,option)
+      else
+         call THAuxVarComputeNoFreezing(x_pert,th_auxvar_pert,&
+                              global_auxvar_pert,material_auxvar_pert,&
+                              iphase,characteristic_curves,thermal_cc, &
+                              th_parameter,icct, &
+                              -999,PETSC_TRUE,option)
+      endif
+
+      call THAccumulation(th_auxvar_pert,global_auxvar_pert, &
+                          material_auxvar_pert, &
+                          th_parameter, &
+                          rock_dencpr,option,vol_frac_prim, &
+                          res_pert)
+      J_pert(:,ideriv) = (res_pert(:)-res(:))/pert
+    enddo
+
+    J = J_pert
+    call GlobalAuxVarStrip(global_auxvar_pert)
+    call MaterialAuxVarStrip(material_auxvar_pert)
+  endif
+
+end subroutine THAccumDerivative
+
+! ************************************************************************** !
+
+subroutine THAccumulation(th_auxvar,global_auxvar,material_auxvar, &
+                          th_parameter,rock_dencpr,option, &
+                          vol_frac_prim,Res)
+  !
+  ! Computes the non-fixed portion of the accumulation
+  ! term for the residual
+  !
+  ! Author: ???
+  ! Date: 12/13/07
+  !
+
+  use Option_module
+  use Material_Aux_module, only : material_auxvar_type
+  use EOS_Water_module
+
+  implicit none
+
+  type(th_auxvar_type) :: th_auxvar
+  type(global_auxvar_type) :: global_auxvar
+  type(material_auxvar_type) :: material_auxvar
+  type(th_parameter_type) :: th_parameter
+  type(option_type) :: option
+  PetscReal :: Res(1:option%nflowdof)
+  PetscReal ::rock_dencpr
+
+  PetscReal :: vol,por
+  PetscReal :: porXvol, kmol, eng
+  PetscReal :: vol_frac_prim
+
+  ! ice variables
+  PetscReal :: sat_g, den_g, kmol_g, u_g
+  PetscReal :: sat_i, den_i, u_i
+
+  Res = 0.d0
+
+  vol = material_auxvar%volume
+  por = th_auxvar%effective_porosity
+
+  ! TechNotes, TH Mode: First term of Equation 8
+  porXvol = por*vol
+  ! [kmol] = [m^3 water/m^3 por] * [kmol water/m^3 water] * [m^3 pore/m^3 bulk] &
+  !           * [m^3 bulk]
+  kmol = th_auxvar%sat*th_auxvar%den*porXvol
+
+! TechNotes, TH Mode: First term of Equation 9
+  ! rock_dencpr [MJ/m^3 rock-K]
+  ! [MJ] = [m^3 water/m^3 por] * [kmol water/m^3 water] * [MJ/kmol water] &
+  !        * [m^3 pore/m^3 bulk] * [m^3 bulk] + [m^3 rock/m^3 bulk] * [m^3 bulk] &
+  !        * [MJ/m^3 rock-K] * [C]
+  eng = th_auxvar%sat * &
+        th_auxvar%den * &
+        th_auxvar%u * porXvol + &
+        (1.d0 - por) * vol * rock_dencpr * th_auxvar%temp
+
+  if (option%flow%th_freezing) then
+     ! SK, 11/17/11
+     sat_g = th_auxvar%ice%sat_gas
+     sat_i = th_auxvar%ice%sat_ice
+     u_i   = th_auxvar%ice%u_ice
+     den_i = th_auxvar%ice%den_ice
+     den_g = th_auxvar%ice%den_gas
+     kmol_g = th_auxvar%ice%mol_gas
+     u_g = th_auxvar%ice%u_gas
+     kmol = kmol + (sat_g*den_g*kmol_g + sat_i*den_i)*porXvol
+     eng = eng + (sat_g*den_g*u_g + sat_i*den_i*u_i)*porXvol
+  endif
+  ! [kmol/s]
+  Res(TH_LIQUID_EQUATION_INDEX) = kmol/option%flow_dt
+  ! [MJ/s]
+  Res(TH_ENERGY_EQUATION_INDEX) = vol_frac_prim*eng/option%flow_dt
+
+end subroutine THAccumulation
+
+! ************************************************************************** !
+
+subroutine THFluxDerivative(th_auxvar_up,global_auxvar_up, &
+                            material_auxvar_up, &
+                            Dk_up, &
+                            icct_up, &
+                            th_auxvar_dn,global_auxvar_dn, &
+                            material_auxvar_dn, &
+                            Dk_dn, &
+                            icct_dn, &
+                            area, &
+                            dist, upweight, &
+                            sir_up,sir_dn, &
+                            option,sf_up,sf_dn, &
+                            cc_up,cc_dn, &
+                            tcc_up,tcc_dn, &
+                            Dk_dry_up,Dk_dry_dn, &
+                            Dk_ice_up,Dk_ice_dn, &
+                            alpha_up,alpha_dn,alpha_fr_up,alpha_fr_dn, &
+                            th_parameter, &
+                            Jup,Jdn)
+
+  !
+  ! Computes the derivatives of the internal flux terms
+  ! for the Jacobian
+  !
+  ! Author: ???
+  ! Date: 12/13/07
+  !
+
+  use Option_module
+  use Characteristic_Curves_module
+  use Characteristic_Curves_Thermal_module
+  use Saturation_Function_module
+  use Connection_module
+  use EOS_Water_module
+  use Utility_module
+
+  implicit none
+
+  type(th_auxvar_type) :: th_auxvar_up, th_auxvar_dn
+  type(global_auxvar_type) :: global_auxvar_up, global_auxvar_dn
+  type(material_auxvar_type) :: material_auxvar_up, material_auxvar_dn
+  type(option_type) :: option
+  PetscReal :: sir_up, sir_dn
+  PetscReal :: dd_up, dd_dn
+  PetscReal :: perm_up, perm_dn
+  PetscReal :: Dk_up, Dk_dn
+  PetscReal :: Dk_dry_up, Dk_dry_dn
+  PetscReal :: Dk_ice_up, Dk_ice_dn
+  PetscReal :: alpha_up, alpha_dn
+  PetscReal :: alpha_fr_up, alpha_fr_dn
+  PetscInt :: icct_up, icct_dn
+  PetscReal :: v_darcy, area
+  PetscReal :: dist(-1:3)
+  type(saturation_function_type), pointer :: sf_up, sf_dn
+  class(characteristic_curves_type), pointer :: cc_up, cc_dn
+  class(cc_thermal_type), pointer :: tcc_up, tcc_dn
+  type(th_parameter_type) :: th_parameter
+  PetscReal :: Jup(option%nflowdof,option%nflowdof)
+  PetscReal :: Jdn(option%nflowdof,option%nflowdof)
+
+  PetscReal :: por_up, por_dn
+  PetscReal :: tor_up, tor_dn
+  PetscReal :: dist_gravity  ! distance along gravity vector
+  PetscReal :: fluxm,fluxe,q
+  PetscReal :: uh,ukvr,DK,Dq
+  PetscReal :: upweight,density_ave,gravity,dphi
+
+  PetscReal :: dden_ave_dp_up, dden_ave_dp_dn, dden_ave_dT_up, dden_ave_dT_dn
+  PetscReal :: dgravity_dden_up, dgravity_dden_dn
+  PetscReal :: dphi_dp_up, dphi_dp_dn, dphi_dT_up, dphi_dT_dn
+  PetscReal :: dukvr_dp_up, dukvr_dp_dn, dukvr_dT_up, dukvr_dT_dn
+  PetscReal :: duh_dp_up, duh_dp_dn, duh_dT_up, duh_dT_dn
+  PetscReal :: dq_dp_up, dq_dp_dn, dq_dT_up, dq_dT_dn
+
+  PetscReal :: Dk_eff_up, Dk_eff_dn
+  PetscReal :: dk_ds_up, dK_di_up, dk_dT_up
+  PetscReal :: dk_ds_dn, dK_di_dn, dk_dT_dn
+  PetscReal :: dKe_dT_up, dKe_dp_up
+  PetscReal :: dKe_dT_dn, dKe_dp_dn
+  PetscReal :: dDk_dT_up, dDk_dT_dn
+  PetscReal :: dDk_dp_up, dDk_dp_dn
+
+  PetscInt :: iphase, ideriv
+  type(th_auxvar_type) :: th_auxvar_pert_up, th_auxvar_pert_dn
+  type(global_auxvar_type) :: global_auxvar_pert_up, global_auxvar_pert_dn
+  PetscReal :: x_up(option%nflowdof), x_dn(option%nflowdof)
+  PetscReal :: x_pert_up(option%nflowdof), x_pert_dn(option%nflowdof)
+  PetscReal :: pert_up, pert_dn
+  PetscReal :: res(option%nflowdof)
+  PetscReal :: res_pert_up(option%nflowdof)
+  PetscReal :: res_pert_dn(option%nflowdof)
+  PetscReal :: J_pert_up(option%nflowdof,option%nflowdof)
+  PetscReal :: J_pert_dn(option%nflowdof,option%nflowdof)
+  type(material_auxvar_type), allocatable :: material_auxvar_pert_dn, &
+                                              material_auxvar_pert_up
+
+  ! ice variables
+  PetscReal :: Ddiffgas_avg, Ddiffgas_up, Ddiffgas_dn
+  PetscReal :: p_g
+  PetscReal :: deng_up, deng_dn
+  PetscReal :: psat_up, psat_dn
+  PetscReal :: molg_up, molg_dn
+  PetscReal :: satg_up, satg_dn
+  PetscReal :: Diffg_up, Diffg_dn
+  PetscReal :: ddeng_dT_up, ddeng_dT_dn
+  PetscReal :: dpsat_dT_up, dpsat_dT_dn
+  PetscReal :: dmolg_dT_up, dmolg_dT_dn
+  PetscReal :: dDiffg_dT_up, dDiffg_dT_dn
+  PetscReal :: dDiffg_dp_up, dDiffg_dp_dn
+  PetscReal :: dsatg_dp_up, dsatg_dp_dn
+  PetscReal :: Diffg_ref, p_ref, T_ref
+  PetscErrorCode :: ierr
+  PetscReal :: Ke_fr_up,Ke_fr_dn   ! frozen soil Kersten numbers
+  PetscReal :: dKe_fr_dT_up, dKe_fr_dT_dn
+  PetscReal :: dKe_fr_dp_up, dKe_fr_dp_dn
+  PetscReal :: fv_up, fv_dn
+  PetscReal :: dfv_dT_up, dfv_dT_dn
+  PetscReal :: dfv_dp_up, dfv_dp_dn
+  PetscReal :: dmolg_dp_up, dmolg_dp_dn
+  PetscBool :: is_flowing
+  PetscInt :: idof, ieq
+
+  Jup = 0.d0
+  Jdn = 0.d0
+
+  if (th_numerical_derivatives) then
+    call THFlux(th_auxvar_up,global_auxvar_up, &
+                material_auxvar_up,Dk_up,tcc_up, &
+                th_auxvar_dn,global_auxvar_dn, &
+                material_auxvar_dn,Dk_dn,tcc_dn, &
+                area,dist,upweight,sir_up,sir_dn, &
+                option,v_darcy,Dk_dry_up, &
+                Dk_dry_dn,Dk_ice_up,Dk_ice_dn, &
+                alpha_up,alpha_dn,alpha_fr_up,alpha_fr_dn, &
+                res)
+    do idof = 1, option%nflowdof
+      call THFlux(th_auxvar_up%auxvar_pert(idof),global_auxvar_up, &
+                  material_auxvar_up,Dk_up,tcc_up, &
+                  th_auxvar_dn,global_auxvar_dn, &
+                  material_auxvar_dn,Dk_dn,tcc_dn, &
+                  area,dist,upweight,sir_up,sir_dn, &
+                  option,v_darcy,Dk_dry_up, &
+                  Dk_dry_dn,Dk_ice_up,Dk_ice_dn, &
+                  alpha_up,alpha_dn,alpha_fr_up,alpha_fr_dn, &
+                  res_pert_up)
+      do ieq = 1, option%nflowdof
+        Jup(ieq,idof) = (res_pert_up(ieq)-res(ieq)) / &
+                        th_auxvar_up%auxvar_pert(idof)%pert
+      enddo
+    enddo
+    do idof = 1, option%nflowdof
+      call THFlux(th_auxvar_up,global_auxvar_up, &
+                  material_auxvar_up,Dk_up,tcc_up, &
+                  th_auxvar_dn%auxvar_pert(idof),global_auxvar_dn, &
+                  material_auxvar_dn,Dk_dn,tcc_dn, &
+                  area,dist,upweight,sir_up,sir_dn, &
+                  option,v_darcy,Dk_dry_up, &
+                  Dk_dry_dn,Dk_ice_up,Dk_ice_dn, &
+                  alpha_up,alpha_dn,alpha_fr_up,alpha_fr_dn, &
+                  res_pert_dn)
+      do ieq = 1, option%nflowdof
+        Jdn(ieq,idof) = (res_pert_dn(ieq)-res(ieq)) / &
+                        th_auxvar_up%auxvar_pert(idof)%pert
+      enddo
+    enddo
+    return
+  endif
+
+  call ConnectionCalculateDistances(dist,option%gravity,dd_up,dd_dn, &
+                                    dist_gravity,upweight)
+  call PermeabilityTensorToScalar(material_auxvar_up,dist,perm_up)
+  call PermeabilityTensorToScalar(material_auxvar_dn,dist,perm_dn)
+
+  por_up = material_auxvar_up%porosity_base
+  por_dn = material_auxvar_dn%porosity_base
+
+  tor_up = material_auxvar_up%tortuosity
+  tor_dn = material_auxvar_dn%tortuosity
+
+  Dq = (perm_up * perm_dn)/(dd_up*perm_dn + dd_dn*perm_up)
+
+  fluxm = 0.D0
+  fluxe = 0.D0
+  v_darcy = 0.D0
+
+  dden_ave_dp_up = 0.d0
+  dden_ave_dT_up = 0.d0
+  dden_ave_dp_dn = 0.d0
+  dden_ave_dT_dn = 0.d0
+  dgravity_dden_up = 0.d0
+  dgravity_dden_dn = 0.d0
+  dphi_dp_up = 0.d0
+  dphi_dp_dn = 0.d0
+  dphi_dT_up = 0.d0
+  dphi_dT_dn = 0.d0
+  dukvr_dp_up = 0.d0
+  dukvr_dp_dn = 0.d0
+  dukvr_dT_up = 0.d0
+  dukvr_dT_dn = 0.d0
+  duh_dp_up = 0.d0
+  duh_dp_dn = 0.d0
+  duh_dT_up = 0.d0
+  duh_dT_dn = 0.d0
+  dq_dp_up = 0.d0
+  dq_dp_dn = 0.d0
+  dq_dT_up = 0.d0
+  dq_dT_dn = 0.d0
+  dDk_dT_up = 0.d0
+  dDk_dT_dn = 0.d0
+  dDk_dp_up = 0.d0
+  dDk_dp_dn = 0.d0
+
+  if (option%flow%th_freezing) then
+    dfv_dT_up = 0.d0
+    dfv_dT_dn = 0.d0
+    dfv_dp_up = 0.d0
+    dfv_dp_dn = 0.d0
+    dmolg_dp_up = 0.d0
+    dmolg_dp_dn = 0.d0
+    dmolg_dT_up = 0.d0
+    dmolg_dT_dn = 0.d0
+  endif
+
+  ! Flow term
+  is_flowing = PETSC_FALSE
+
+  if (option%flow%th_freezing) then
+    if (th_auxvar_up%sat > sir_up .or. &
+        th_auxvar_dn%sat > sir_dn) then
+      is_flowing = PETSC_TRUE
+    endif
+  else
+    if (th_auxvar_up%mobility > eps .or. &
+        th_auxvar_dn%mobility > eps) then
+      is_flowing = PETSC_TRUE
+    endif
+  endif
+
+  if (is_flowing) then
+    if (th_auxvar_up%sat <eps) then
+      upweight=0.d0
+    else if (th_auxvar_dn%sat <eps) then
+      upweight=1.d0
+    endif
+    density_ave = upweight*th_auxvar_up%den+ &
+                  (1.D0-upweight)*th_auxvar_dn%den
+    dden_ave_dp_up = upweight*th_auxvar_up%dden_dp
+    dden_ave_dp_dn = (1.D0-upweight)*th_auxvar_dn%dden_dp
+    dden_ave_dT_up = upweight*th_auxvar_up%dden_dT
+    dden_ave_dT_dn = (1.D0-upweight)*th_auxvar_dn%dden_dT
+
+    gravity = (upweight*th_auxvar_up%den*th_auxvar_up%avgmw + &
+              (1.D0-upweight)*th_auxvar_dn%den*th_auxvar_dn%avgmw) &
+              * dist_gravity
+    dgravity_dden_up = upweight*th_auxvar_up%avgmw*dist_gravity
+    dgravity_dden_dn = (1.d0-upweight)*th_auxvar_dn%avgmw*dist_gravity
+
+    if (th_ice_model /= DALL_AMICO) then
+      dphi = th_auxvar_up%pres - th_auxvar_dn%pres + gravity
+      dphi_dp_up = 1.d0 + dgravity_dden_up*th_auxvar_up%dden_dp
+      dphi_dp_dn = -1.d0 + dgravity_dden_dn*th_auxvar_dn%dden_dp
+      dphi_dT_up = dgravity_dden_up*th_auxvar_up%dden_dT
+      dphi_dT_dn = dgravity_dden_dn*th_auxvar_dn%dden_dT
+    else
+      dphi = th_auxvar_up%ice%pres_fh2o - th_auxvar_dn%ice%pres_fh2o + gravity
+      dphi_dp_up =  th_auxvar_up%ice%dpres_fh2o_dp + &
+                    dgravity_dden_up*th_auxvar_up%dden_dp
+      dphi_dp_dn = -th_auxvar_dn%ice%dpres_fh2o_dp + &
+                    dgravity_dden_dn*th_auxvar_dn%dden_dp
+      dphi_dT_up =  th_auxvar_up%ice%dpres_fh2o_dT + &
+                    dgravity_dden_up*th_auxvar_up%dden_dT
+      dphi_dT_dn = -th_auxvar_dn%ice%dpres_fh2o_dT + &
+                    dgravity_dden_dn*th_auxvar_dn%dden_dT
+    endif
+
+    if (dphi>=0.D0) then
+      ukvr = th_auxvar_up%mobility
+      dukvr_dp_up = th_auxvar_up%dmobility_dp
+      dukvr_dT_up = th_auxvar_up%dmobility_dT
+
+      uh = th_auxvar_up%h
+      duh_dp_up = th_auxvar_up%dh_dp
+      duh_dT_up = th_auxvar_up%dh_dT
+    else
+      ukvr = th_auxvar_dn%mobility
+      dukvr_dp_dn = th_auxvar_dn%dmobility_dp
+      dukvr_dT_dn = th_auxvar_dn%dmobility_dT
+
+      uh = th_auxvar_dn%h
+      duh_dp_dn = th_auxvar_dn%dh_dp
+      duh_dT_dn = th_auxvar_dn%dh_dT
+    endif
+
+    call InterfaceApprox(th_auxvar_up%mobility, th_auxvar_dn%mobility, &
+                         th_auxvar_up%dmobility_dp, th_auxvar_dn%dmobility_dp, &
+                         dphi, &
+                         option%flow%rel_perm_aveg, &
+                         ukvr, dukvr_dp_up, dukvr_dp_dn)
+
+    call InterfaceApprox(th_auxvar_up%mobility, th_auxvar_dn%mobility, &
+                         th_auxvar_up%dmobility_dT, th_auxvar_dn%dmobility_dT, &
+                         dphi, &
+                         option%flow%rel_perm_aveg, &
+                         ukvr, dukvr_dT_up, dukvr_dT_dn)
+
+    if (ukvr>floweps) then
+      v_darcy= Dq * ukvr * dphi
+
+      q = v_darcy * area
+
+
+      dq_dT_up = Dq*(dukvr_dT_up*dphi+ukvr*dphi_dT_up)*area
+      dq_dT_dn = Dq*(dukvr_dT_dn*dphi+ukvr*dphi_dT_dn)*area
+
+      dq_dp_up = Dq*(dukvr_dp_up*dphi+ukvr*dphi_dp_up)*area
+      dq_dp_dn = Dq*(dukvr_dp_dn*dphi+ukvr*dphi_dp_dn)*area
+
+
+
+      ! If only solving the energy equation, ensure Jup(2,2) & Jdn(2,2)
+      ! have no contribution from the mass equation
+      if (option%flow%only_energy_eq) then
+         v_darcy = 0.d0
+         q = 0.d0
+         dq_dT_up = 0.d0
+         dq_dT_dn = 0.d0
+      endif
+
+      Jup(TH_LIQUID_EQUATION_INDEX,TH_PRESSURE_DOF) = &
+        (dq_dp_up*density_ave+q*dden_ave_dp_up)
+      Jup(TH_LIQUID_EQUATION_INDEX,TH_TEMPERATURE_DOF) = &
+        (dq_dT_up*density_ave+q*dden_ave_dT_up)
+
+      Jdn(TH_LIQUID_EQUATION_INDEX,TH_PRESSURE_DOF) = &
+        (dq_dp_dn*density_ave+q*dden_ave_dp_dn)
+      Jdn(TH_LIQUID_EQUATION_INDEX,TH_TEMPERATURE_DOF) = &
+        (dq_dT_dn*density_ave+q*dden_ave_dT_dn)
+
+      ! based on flux = q*density_ave*uh
+      Jup(TH_ENERGY_EQUATION_INDEX,TH_PRESSURE_DOF) = &
+        (dq_dp_up*density_ave+q*dden_ave_dp_up)*uh+ &
+        q*density_ave*duh_dp_up
+      Jup(TH_ENERGY_EQUATION_INDEX,TH_TEMPERATURE_DOF) = &
+        (dq_dT_up*density_ave+q*dden_ave_dT_up)*uh+ &
+        q*density_ave*duh_dT_up
+      Jdn(TH_ENERGY_EQUATION_INDEX,TH_PRESSURE_DOF) = &
+        (dq_dp_dn*density_ave+q*dden_ave_dp_dn)*uh+ &
+        q*density_ave*duh_dp_dn
+      Jdn(TH_ENERGY_EQUATION_INDEX,TH_TEMPERATURE_DOF) = &
+        (dq_dT_dn*density_ave+q*dden_ave_dT_dn)*uh+ &
+        q*density_ave*duh_dT_dn
+
+    endif
+  endif
+
+  if (option%flow%th_freezing) then
+    ! Added by Satish Karra, updated 11/11/11
+    satg_up = th_auxvar_up%ice%sat_gas
+    satg_dn = th_auxvar_dn%ice%sat_gas
+    if ((satg_up > eps) .and. (satg_dn > eps)) then
+      p_g = option%flow%reference_pressure  ! set to reference pressure
+      deng_up = p_g/(IDEAL_GAS_CONSTANT* &
+                (th_auxvar_up%temp + T273K))*1.d-3
+      deng_dn = p_g/(IDEAL_GAS_CONSTANT* &
+                (th_auxvar_dn%temp + T273K))*1.d-3
+
+      Diffg_ref = 2.13D-5 ! Reference diffusivity, need to read from input file
+      p_ref = 1.01325d5   ! in Pa
+      T_ref = 25.d0       ! in deg C
+
+      Diffg_up = Diffg_ref*(p_ref/p_g)*((th_auxvar_up%temp + T273K)/ &
+           (T_ref + T273K))**(1.8)
+      Diffg_dn = Diffg_ref*(p_ref/p_g)*((th_auxvar_dn%temp + T273K)/ &
+           (T_ref + T273K))**(1.8)
+
+      Ddiffgas_up = por_up*tor_up*satg_up*deng_up*Diffg_up
+      Ddiffgas_dn = por_dn*tor_dn*satg_dn*deng_dn*Diffg_dn
+      call EOSWaterSaturationPressure(th_auxvar_up%temp, psat_up, &
+                                      dpsat_dT_up, ierr)
+      call EOSWaterSaturationPressure(th_auxvar_dn%temp, psat_dn, &
+                                      dpsat_dT_dn, ierr)
+
+      ! vapor pressure lowering due to capillary pressure
+      fv_up = exp(-th_auxvar_up%pc/(th_auxvar_up%den* &
+           IDEAL_GAS_CONSTANT*(th_auxvar_up%temp + T273K)))
+      fv_dn = exp(-th_auxvar_dn%pc/(th_auxvar_dn%den* &
+           IDEAL_GAS_CONSTANT*(th_auxvar_dn%temp + T273K)))
+
+      molg_up = psat_up*fv_up/p_g
+      molg_dn = psat_dn*fv_dn/p_g
+
+      dfv_dT_up = fv_up*(th_auxvar_up%pc/IDEAL_GAS_CONSTANT/ &
+           (th_auxvar_up%den* &
+           (th_auxvar_up%temp + T273K))**2)* &
+           (th_auxvar_up%dden_dT*(th_auxvar_up%temp + T273K) &
+           + th_auxvar_up%den)
+      dfv_dT_dn = fv_dn*(th_auxvar_dn%pc/IDEAL_GAS_CONSTANT/ &
+           (th_auxvar_dn%den* &
+           (th_auxvar_dn%temp + T273K))**2)* &
+           (th_auxvar_dn%dden_dT*(th_auxvar_dn%temp + T273K) &
+           + th_auxvar_dn%den)
+
+      dfv_dp_up = fv_up*(th_auxvar_up%pc/IDEAL_GAS_CONSTANT/ &
+           (th_auxvar_up%den)**2/ &
+           (th_auxvar_up%temp + T273K)*th_auxvar_up%dden_dp &
+           + 1.d0/IDEAL_GAS_CONSTANT/th_auxvar_up%den/ &
+           (th_auxvar_up%temp + T273K))
+      dfv_dp_dn = fv_dn*(th_auxvar_dn%pc/IDEAL_GAS_CONSTANT/ &
+           (th_auxvar_dn%den)**2/ &
+           (th_auxvar_dn%temp + T273K)*th_auxvar_dn%dden_dp &
+           + 1.d0/IDEAL_GAS_CONSTANT/th_auxvar_dn%den/ &
+           (th_auxvar_dn%temp + T273K))
+
+      dmolg_dT_up = (1/p_g)*dpsat_dT_up*fv_up + psat_up/p_g*dfv_dT_up
+      dmolg_dT_dn = (1/p_g)*dpsat_dT_dn*fv_dn + psat_dn/p_g*dfv_dT_dn
+
+      dmolg_dp_up = psat_up/p_g*dfv_dp_up
+      dmolg_dp_dn = psat_dn/p_g*dfv_dp_dn
+
+      ddeng_dT_up = - p_g/(IDEAL_GAS_CONSTANT*(th_auxvar_up%temp + &
+           T273K)**2)*1.d-3
+      ddeng_dT_dn = - p_g/(IDEAL_GAS_CONSTANT*(th_auxvar_dn%temp + &
+           T273K)**2)*1.d-3
+
+      dDiffg_dT_up = 1.8*Diffg_up/(th_auxvar_up%temp + T273K)
+      dDiffg_dT_dn = 1.8*Diffg_dn/(th_auxvar_dn%temp + T273K)
+
+      dDiffg_dp_up = 0.d0
+      dDiffg_dp_dn = 0.d0
+
+      dsatg_dp_up = th_auxvar_up%ice%dsat_gas_dp
+      dsatg_dp_dn = th_auxvar_dn%ice%dsat_gas_dp
+
+      if (molg_up > molg_dn) then
+         upweight = 0.d0
+      else
+         upweight = 1.d0
+      endif
+
+      Ddiffgas_avg = upweight*Ddiffgas_up + (1.D0 - upweight)*Ddiffgas_dn
+
+#ifndef NO_VAPOR_DIFFUION
+      Jup(TH_LIQUID_EQUATION_INDEX,TH_PRESSURE_DOF) = &
+        Jup(TH_LIQUID_EQUATION_INDEX,TH_PRESSURE_DOF) + &
+           (upweight*por_up*tor_up*deng_up* &
+            (Diffg_up*dsatg_dp_up + satg_up*dDiffg_dp_up)* &
+            (molg_up - molg_dn) + Ddiffgas_up*dmolg_dp_up) / &
+           (dd_up + dd_dn)*area
+
+      Jup(TH_LIQUID_EQUATION_INDEX,TH_TEMPERATURE_DOF) = &
+        Jup(TH_LIQUID_EQUATION_INDEX,TH_TEMPERATURE_DOF) + &
+          (upweight*por_up*tor_up*satg_up* &
+           (Diffg_up*ddeng_dT_up + deng_up*dDiffg_dT_up)* &
+           (molg_up - molg_dn) + &
+           Ddiffgas_avg*dmolg_dT_up) / &
+          (dd_up + dd_dn)*area
+
+      Jdn(TH_LIQUID_EQUATION_INDEX,TH_PRESSURE_DOF) = &
+        Jdn(TH_LIQUID_EQUATION_INDEX,TH_PRESSURE_DOF) + &
+           ((1.D0 - upweight)*por_dn*tor_dn*deng_dn* &
+           (Diffg_dn*dsatg_dp_dn + satg_dn*dDiffg_dp_dn)* &
+           (molg_up - molg_dn) + Ddiffgas_avg*(-dmolg_dp_dn)) / &
+           (dd_up + dd_dn)*area
+
+      Jdn(TH_LIQUID_EQUATION_INDEX,TH_TEMPERATURE_DOF) = &
+        Jdn(TH_LIQUID_EQUATION_INDEX,TH_TEMPERATURE_DOF) + &
+           ((1.D0 - upweight)*por_dn*tor_dn*satg_dn* &
+            (Diffg_dn*ddeng_dT_dn + deng_dn*dDiffg_dp_dn)* &
+            (molg_up - molg_dn) + &
+            Ddiffgas_avg*(-dmolg_dT_dn)) / &
+           (dd_up + dd_dn)*area
+#endif
+   endif
+
+  endif
+
+
+    dKe_dp_up = th_auxvar_up%dKe_dp
+    dKe_dp_dn = th_auxvar_dn%dKe_dp
+
+    dKe_dT_up = th_auxvar_up%dKe_dT
+    dKe_dT_dn = th_auxvar_dn%dKe_dT
+
+  if (option%flow%th_freezing) then
+
+    call tcc_up%thermal_conductivity_function% &
+         TCondTensorToScalar(dist,option)
+    call tcc_up%thermal_conductivity_function%CalculateFTCond( &
+         th_auxvar_up%sat,th_auxvar_up%ice%sat_ice,th_auxvar_up%temp, &
+         th_auxvar_up%effective_porosity,Dk_eff_up,dk_ds_up, &
+         dK_di_up,dk_dT_up,option)
+
+    call tcc_dn%thermal_conductivity_function% &
+         TCondTensorToScalar(dist,option)
+    call tcc_dn%thermal_conductivity_function%CalculateFTCond( &
+         th_auxvar_dn%sat,th_auxvar_dn%ice%sat_ice,th_auxvar_dn%temp, &
+         th_auxvar_dn%effective_porosity,Dk_eff_dn,dk_ds_dn, &
+         dK_di_dn,dk_dT_dn,option)
+
+    Ke_fr_up = th_auxvar_up%ice%Ke_fr
+    Ke_fr_dn = th_auxvar_dn%ice%Ke_fr
+
+    dKe_fr_dT_up = th_auxvar_up%ice%dKe_fr_dT
+    dKe_fr_dT_dn = th_auxvar_dn%ice%dKe_fr_dT
+
+    dKe_fr_dp_up = th_auxvar_up%ice%dKe_fr_dp
+    dKe_fr_dp_dn = th_auxvar_dn%ice%dKe_fr_dp
+
+  else
+
+    call tcc_up%thermal_conductivity_function% &
+         TCondTensorToScalar(dist,option)
+    call tcc_up%thermal_conductivity_function%CalculateTCond( &
+         th_auxvar_up%sat,th_auxvar_up%temp, &
+         th_auxvar_up%effective_porosity,Dk_eff_up,dk_ds_up, &
+         dk_dT_up,option)
+
+    call tcc_dn%thermal_conductivity_function% &
+         TCondTensorToScalar(dist,option)
+    call tcc_dn%thermal_conductivity_function%CalculateTCond( &
+         th_auxvar_dn%sat,th_auxvar_dn%temp, &
+         th_auxvar_dn%effective_porosity,Dk_eff_dn,dk_ds_dn, &
+         dk_dT_dn,option)
+
+  endif
+
+  Dk = (Dk_eff_up * Dk_eff_dn) / (dd_dn*Dk_eff_up + dd_up*Dk_eff_dn)
+
+  if (option%flow%th_freezing) then
+
+    dDk_dT_up = Dk**2/Dk_eff_up**2*dd_up*(Dk_up*dKe_dT_up + &
+        Dk_ice_up*dKe_fr_dT_up + (- dKe_dT_up - dKe_fr_dT_up)* &
+        Dk_dry_up)
+    dDk_dT_dn = Dk**2/Dk_eff_dn**2*dd_dn*(Dk_dn*dKe_dT_dn + &
+        Dk_ice_dn*dKe_fr_dT_dn + (- dKe_dT_dn - dKe_fr_dT_dn)* &
+        Dk_dry_dn)
+
+    dDk_dp_up = Dk**2/Dk_eff_up**2*dd_up*(Dk_up*dKe_dp_up + &
+        Dk_ice_up*dKe_fr_dp_up + (- dKe_dp_up - dKe_fr_dp_up)* &
+        Dk_dry_up)
+
+    dDk_dp_dn = Dk**2/Dk_eff_dn**2*dd_dn*(Dk_dn*dKe_dp_dn + &
+        Dk_ice_dn*dKe_fr_dp_dn + (- dKe_dp_dn - dKe_fr_dp_dn)* &
+        Dk_dry_dn)
+
+  else
+
+    dDk_dT_up = Dk**2/Dk_eff_up**2*dd_up*(Dk_up - Dk_dry_up)*dKe_dT_up
+    dDk_dT_dn = Dk**2/Dk_eff_dn**2*dd_dn*(Dk_dn - Dk_dry_dn)*dKe_dT_dn
+
+    dDk_dp_up = Dk**2/Dk_eff_up**2*dd_up*(Dk_up - Dk_dry_up)*dKe_dp_up
+    dDk_dp_dn = Dk**2/Dk_eff_dn**2*dd_dn*(Dk_dn - Dk_dry_dn)*dKe_dp_dn
+
+  endif
+
+  !  cond = Dk*area*(th_auxvar_up%temp-th_auxvar_dn%temp)
+  Jup(TH_ENERGY_EQUATION_INDEX,TH_PRESSURE_DOF) = &
+    Jup(TH_ENERGY_EQUATION_INDEX,TH_PRESSURE_DOF) + &
+                           area*(th_auxvar_up%temp - &
+                           th_auxvar_dn%temp)*dDk_dp_up
+  Jdn(TH_ENERGY_EQUATION_INDEX,TH_PRESSURE_DOF) = &
+    Jdn(TH_ENERGY_EQUATION_INDEX,TH_PRESSURE_DOF) + &
+                           area*(th_auxvar_up%temp - &
+                           th_auxvar_dn%temp)*dDk_dp_dn
+
+  Jup(TH_ENERGY_EQUATION_INDEX,TH_TEMPERATURE_DOF) = &
+    Jup(TH_ENERGY_EQUATION_INDEX,TH_TEMPERATURE_DOF) + Dk*area + &
+                           area*(th_auxvar_up%temp - &
+                           th_auxvar_dn%temp)*dDk_dT_up
+  Jdn(TH_ENERGY_EQUATION_INDEX,TH_TEMPERATURE_DOF) = &
+    Jdn(TH_ENERGY_EQUATION_INDEX,TH_TEMPERATURE_DOF) + Dk*area*(-1.d0) + &
+                           area*(th_auxvar_up%temp - &
+                           th_auxvar_dn%temp)*dDk_dT_dn
+
+  ! If only solving the energy equation,
+  !  - Set jacobian term corresponding to mass-equation to zero, and
+  !  - Set off-diagonal jacobian terms to zero.
+  if (option%flow%only_energy_eq) then
+    Jup(TH_LIQUID_EQUATION_INDEX,TH_PRESSURE_DOF) = 0.d0
+    Jup(TH_LIQUID_EQUATION_INDEX,TH_TEMPERATURE_DOF) = 0.d0
+    Jup(TH_ENERGY_EQUATION_INDEX,TH_PRESSURE_DOF) = 0.d0
+
+    Jdn(TH_LIQUID_EQUATION_INDEX,TH_PRESSURE_DOF) = 0.d0
+    Jdn(TH_LIQUID_EQUATION_INDEX,TH_TEMPERATURE_DOF) = 0.d0
+    Jdn(TH_ENERGY_EQUATION_INDEX,TH_PRESSURE_DOF) = 0.d0
+
+  endif
+
+  ! note: Res is the flux contribution, for node up J = J + Jup
+  !                                              dn J = J - Jdn
+
+  if (option%flow%numerical_derivatives) then
+    call THAuxVarCopy(th_auxvar_up,th_auxvar_pert_up,option)
+    call THAuxVarCopy(th_auxvar_dn,th_auxvar_pert_dn,option)
+
+    call GlobalAuxVarInit(global_auxvar_pert_up,option)
+    call GlobalAuxVarInit(global_auxvar_pert_dn,option)
+    call GlobalAuxVarCopy(global_auxvar_up,global_auxvar_pert_up,option)
+    call GlobalAuxVarCopy(global_auxvar_dn,global_auxvar_pert_dn,option)
+
+    allocate(material_auxvar_pert_up,material_auxvar_pert_dn)
+    call MaterialAuxVarInit(material_auxvar_pert_up,option)
+    call MaterialAuxVarInit(material_auxvar_pert_dn,option)
+    call MaterialAuxVarCopy(material_auxvar_up,material_auxvar_pert_up,option)
+    call MaterialAuxVarCopy(material_auxvar_dn,material_auxvar_pert_dn,option)
+
+    x_up(1) = th_auxvar_up%pres
+    x_up(2) = th_auxvar_up%temp
+    x_dn(1) = th_auxvar_dn%pres
+    x_dn(2) = th_auxvar_dn%temp
+
+    call THFlux( &
+      th_auxvar_up,global_auxvar_up, &
+      material_auxvar_up, &
+      Dk_up, tcc_up, &
+      th_auxvar_dn,global_auxvar_dn, &
+      material_auxvar_dn, &
+      Dk_dn, tcc_dn, &
+      area, &
+      dist, upweight, &
+      sir_up, sir_dn, &
+      option,v_darcy,Dk_dry_up,Dk_dry_dn, &
+      Dk_ice_up,Dk_ice_dn, &
+      alpha_up,alpha_dn,alpha_fr_up,alpha_fr_dn, &
+      res)
+
+    do ideriv = 1,option%nflowdof
+      pert_up = x_up(ideriv)*perturbation_tolerance
+      pert_dn = x_dn(ideriv)*perturbation_tolerance
+      x_pert_up = x_up
+      x_pert_dn = x_dn
+
+      if (option%flow%th_freezing) then
+        if (ideriv == 1) then
+          if (x_pert_up(ideriv) < option%flow%reference_pressure) then
+            pert_up = - pert_up
+          endif
+          x_pert_up(ideriv) = x_pert_up(ideriv) + pert_up
+
+          if (x_pert_dn(ideriv) < option%flow%reference_pressure) then
+            pert_dn = - pert_dn
+          endif
+          x_pert_dn(ideriv) = x_pert_dn(ideriv) + pert_dn
+        endif
+
+        if (ideriv == 2) then
+          if (x_pert_up(ideriv) < 0.d0) then
+            pert_up = - 1.d-5
+          else
+            pert_up = 1.d-5
+          endif
+          x_pert_up(ideriv) = x_pert_up(ideriv) + pert_up
+
+          if (x_pert_dn(ideriv) < 0.d0) then
+            pert_dn = - 1.d-5
+          else
+            pert_dn = 1.d-5
+          endif
+          x_pert_dn(ideriv) = x_pert_dn(ideriv) + pert_dn
+        endif
+
+      else
+         x_pert_up(ideriv) = x_pert_up(ideriv) + pert_up
+         x_pert_dn(ideriv) = x_pert_dn(ideriv) + pert_dn
+
+      endif
+
+      if (option%flow%th_freezing) then
+        call THAuxVarComputeFreezing(x_pert_up,th_auxvar_pert_up, &
+             global_auxvar_pert_up, material_auxvar_pert_up, &
+             iphase,sf_up, tcc_up, &
+             th_parameter,icct_up, &
+             -999,PETSC_TRUE,option)
+        call THAuxVarComputeFreezing(x_pert_dn,th_auxvar_pert_dn, &
+             global_auxvar_pert_dn, material_auxvar_pert_up, &
+             iphase,sf_dn, tcc_dn, &
+             th_parameter,icct_up, &
+             -999,PETSC_TRUE,option)
+      else
+        call THAuxVarComputeNoFreezing(x_pert_up,th_auxvar_pert_up, &
+             global_auxvar_pert_up, material_auxvar_pert_up, &
+             iphase,cc_up,tcc_up, &
+             th_parameter,icct_up, &
+             -999,PETSC_TRUE,option)
+        call THAuxVarComputeNoFreezing(x_pert_dn,th_auxvar_pert_dn, &
+             global_auxvar_pert_dn,material_auxvar_pert_dn, &
+             iphase,cc_dn,tcc_dn, &
+             th_parameter,icct_dn, &
+             -999,PETSC_TRUE,option)
+      endif
+
+      call THFlux(th_auxvar_pert_up,global_auxvar_pert_up, &
+                   material_auxvar_pert_up, &
+                   Dk_up, tcc_up, &
+                   th_auxvar_dn,global_auxvar_dn, &
+                   material_auxvar_pert_dn, &
+                   Dk_dn, tcc_dn, &
+                   area, &
+                   dist, upweight, &
+                   sir_up,sir_dn, &
+                   option,v_darcy,Dk_dry_up, &
+                   Dk_dry_dn,Dk_ice_up,Dk_ice_dn, &
+                   alpha_up,alpha_dn,alpha_fr_up,alpha_fr_dn, &
+                   res_pert_up)
+      call THFlux(th_auxvar_up,global_auxvar_up, &
+                   material_auxvar_pert_up, &
+                   Dk_up, tcc_up, &
+                   th_auxvar_pert_dn,global_auxvar_pert_dn, &
+                   material_auxvar_pert_dn, &
+                   Dk_dn, tcc_dn, &
+                   area, &
+                   dist, upweight, &
+                   sir_up,sir_dn, &
+                   option,v_darcy,Dk_dry_up, &
+                   Dk_dry_dn,Dk_ice_up,Dk_ice_dn, &
+                   alpha_up,alpha_dn,alpha_fr_up,alpha_fr_dn, &
+                   res_pert_dn)
+
+      J_pert_up(:,ideriv) = (res_pert_up(:)-res(:))/pert_up
+      J_pert_dn(:,ideriv) = (res_pert_dn(:)-res(:))/pert_dn
+    enddo
+
+    Jup = J_pert_up
+    Jdn = J_pert_dn
+    call GlobalAuxVarStrip(global_auxvar_pert_up)
+    call GlobalAuxVarStrip(global_auxvar_pert_dn)
+    call MaterialAuxVarStrip(material_auxvar_pert_up)
+    call MaterialAuxVarStrip(material_auxvar_pert_dn)
+  endif
+
+end subroutine THFluxDerivative
+
+! ************************************************************************** !
+subroutine THFlux(th_auxvar_up,global_auxvar_up, &
+                  material_auxvar_up, &
+                  Dk_up, tcc_up, &
+                  th_auxvar_dn,global_auxvar_dn, &
+                  material_auxvar_dn, &
+                  Dk_dn, tcc_dn, &
+                  area, &
+                  dist, &
+                  upweight, &
+                  sir_up,sir_dn, &
+                  option,v_darcy,Dk_dry_up, &
+                  Dk_dry_dn,Dk_ice_up,Dk_ice_dn, &
+                  alpha_up,alpha_dn,alpha_fr_up,alpha_fr_dn, &
+                  Res)
+  !
+  ! Computes the internal flux terms for the residual
+  !
+  ! Author: ???
+  ! Date: 12/13/07
+  !
+
+  use Option_module
+  use Connection_module
+  use EOS_Water_module
+  use Utility_module
+  use Characteristic_Curves_Thermal_module
+
+  implicit none
+
+  type(th_auxvar_type) :: th_auxvar_up, th_auxvar_dn
+  type(global_auxvar_type) :: global_auxvar_up, global_auxvar_dn
+  type(material_auxvar_type) :: material_auxvar_up, material_auxvar_dn
+  class(cc_thermal_type), pointer :: tcc_up, tcc_dn
+  type(option_type) :: option
+  PetscReal :: sir_up, sir_dn
+  PetscReal :: dd_up, dd_dn
+  PetscReal :: Dk_up, Dk_dn
+  PetscReal :: Dk_dry_up, Dk_dry_dn
+  PetscReal :: Dk_ice_up, Dk_ice_dn
+  PetscReal :: alpha_up, alpha_dn
+  PetscReal :: alpha_fr_up, alpha_fr_dn
+  PetscReal :: Dk_eff_up, Dk_eff_dn
+  PetscReal :: dk_ds_up, dK_di_up, dk_dT_up
+  PetscReal :: dk_ds_dn, dK_di_dn, dk_dT_dn
+  PetscReal :: v_darcy,area
+  PetscReal :: Res(1:option%nflowdof)
+  PetscReal :: dist(-1:3)
+  PetscReal :: fluxm,fluxe,q
+  PetscReal :: uh,ukvr,DK,Dq
+  PetscReal :: upweight,density_ave,cond,gravity,dphi
+
+  PetscReal :: por_up, por_dn
+  PetscReal :: tor_up, tor_dn
+  PetscReal :: perm_up, perm_dn
+
+  ! ice variables
+  PetscReal :: dist_gravity  ! distance along gravity vector
+  PetscReal :: Ddiffgas_avg, Ddiffgas_up, Ddiffgas_dn
+  PetscReal :: p_g
+  PetscReal :: deng_up, deng_dn
+  PetscReal :: psat_up, psat_dn
+  PetscReal :: molg_up, molg_dn
+  PetscReal :: satg_up, satg_dn
+  PetscReal :: Diffg_up, Diffg_dn
+  PetscReal :: Diffg_ref, p_ref, T_ref
+  PetscErrorCode :: ierr
+  PetscReal :: Ke_fr_up,Ke_fr_dn   ! frozen soil Kersten numbers
+  PetscReal :: fv_up, fv_dn
+  PetscBool :: is_flowing
+
+  Res = 0.d0
+
+  call ConnectionCalculateDistances(dist,option%gravity,dd_up,dd_dn, &
+                                    dist_gravity,upweight)
+  call PermeabilityTensorToScalar(material_auxvar_up,dist,perm_up)
+  call PermeabilityTensorToScalar(material_auxvar_dn,dist,perm_dn)
+
+  por_up = material_auxvar_up%porosity_base
+  por_dn = material_auxvar_dn%porosity_base
+
+  tor_up = material_auxvar_up%tortuosity
+  tor_dn = material_auxvar_dn%tortuosity
+
+  Dq = (perm_up * perm_dn)/(dd_up*perm_dn + dd_dn*perm_up)
+
+  fluxm = 0.D0
+  fluxe = 0.D0
+  v_darcy = 0.D0
+
+  ! Flow term
+  is_flowing = PETSC_FALSE
+
+  if (option%flow%th_freezing) then
+    if (th_auxvar_up%sat > sir_up .or.  &
+        th_auxvar_dn%sat > sir_dn) then
+      is_flowing = PETSC_TRUE
+    endif
+  else
+    if (th_auxvar_up%mobility > eps .or. &
+        th_auxvar_dn%mobility > eps) then
+      is_flowing = PETSC_TRUE
+    endif
+  endif
+
+  if (is_flowing) then
+    if (th_auxvar_up%sat < eps) then
+      upweight=0.d0
+    else if (th_auxvar_dn%sat < eps) then
+      upweight=1.d0
+    endif
+    density_ave = upweight*th_auxvar_up%den+(1.D0-upweight)* &
+                  th_auxvar_dn%den
+
+    gravity = (upweight*th_auxvar_up%den*th_auxvar_up%avgmw + &
+              (1.D0-upweight)*th_auxvar_dn%den*th_auxvar_dn%avgmw) &
+              * dist_gravity
+
+    if (th_ice_model /= DALL_AMICO) then
+      dphi = th_auxvar_up%pres - th_auxvar_dn%pres + gravity
+    else
+      dphi = th_auxvar_up%ice%pres_fh2o - th_auxvar_dn%ice%pres_fh2o + gravity
+    endif
+
+    if (dphi >= 0.D0) then
+      ukvr = th_auxvar_up%mobility
+      uh = th_auxvar_up%h
+    else
+      ukvr = th_auxvar_dn%mobility
+      uh = th_auxvar_dn%h
+    endif
+
+    call InterfaceApprox(th_auxvar_up%mobility, th_auxvar_dn%mobility, dphi, &
+                         option%flow%rel_perm_aveg, ukvr)
+
+    if (ukvr > floweps) then
+      v_darcy = Dq * ukvr * dphi
+
+      ! If only solving the energy equation, ensure Res(2) has no
+      ! contribution from mass equation by setting darcy velocity
+      ! to be zero
+      if (option%flow%only_energy_eq) v_darcy = 0.d0
+
+      q = v_darcy * area
+
+      fluxm = fluxm + q*density_ave
+      fluxe = fluxe + q*density_ave*uh
+    endif
+  endif
+
+
+  if (option%flow%th_freezing) then
+    ! Added by Satish Karra, 10/24/11
+    satg_up = th_auxvar_up%ice%sat_gas
+    satg_dn = th_auxvar_dn%ice%sat_gas
+    if ((satg_up > eps) .and. (satg_dn > eps)) then
+      p_g = option%flow%reference_pressure ! set to reference pressure
+      deng_up = p_g/(IDEAL_GAS_CONSTANT* &
+                (th_auxvar_up%temp + T273K))*1.d-3
+      deng_dn = p_g/(IDEAL_GAS_CONSTANT* &
+                (th_auxvar_dn%temp + T273K))*1.d-3
+
+      Diffg_ref = 2.13D-5 ! Reference diffusivity, need to read from input file
+      p_ref = 1.01325d5 ! in Pa
+      T_ref = 25.d0 ! in deg C
+
+      Diffg_up = Diffg_ref*(p_ref/p_g)*((th_auxvar_up%temp + T273K)/ &
+           (T_ref + T273K))**(1.8)
+      Diffg_dn = Diffg_ref*(p_ref/p_g)*((th_auxvar_dn%temp + T273K)/ &
+           (T_ref + T273K))**(1.8)
+
+      Ddiffgas_up = por_up*tor_up*satg_up*deng_up*Diffg_up
+      Ddiffgas_dn = por_dn*tor_dn*satg_dn*deng_dn*Diffg_dn
+      call EOSWaterSaturationPressure(th_auxvar_up%temp, psat_up, ierr)
+      call EOSWaterSaturationPressure(th_auxvar_dn%temp, psat_dn, ierr)
+
+      ! vapor pressure lowering due to capillary pressure
+      fv_up = exp(-th_auxvar_up%pc/(th_auxvar_up%den* &
+           IDEAL_GAS_CONSTANT*(th_auxvar_up%temp + T273K)))
+      fv_dn = exp(-th_auxvar_dn%pc/(th_auxvar_dn%den* &
+           IDEAL_GAS_CONSTANT*(th_auxvar_dn%temp + T273K)))
+
+      molg_up = psat_up*fv_up/p_g
+      molg_dn = psat_dn*fv_dn/p_g
+
+      if (molg_up > molg_dn) then
+        upweight = 0.d0
+      else
+        upweight = 1.d0
+      endif
+
+      Ddiffgas_avg = upweight*Ddiffgas_up + (1.D0 - upweight)*Ddiffgas_dn
+#ifndef NO_VAPOR_DIFFUSION
+      fluxm = fluxm + Ddiffgas_avg*area*(molg_up - molg_dn)/ &
+           (dd_up + dd_dn)
+#endif
+
+    endif
+
+  endif
+
+  if (option%flow%th_freezing) then
+
+    Ke_fr_up = th_auxvar_up%ice%Ke_fr
+    Ke_fr_dn = th_auxvar_dn%ice%Ke_fr
+
+    call tcc_up%thermal_conductivity_function% &
+         TCondTensorToScalar(dist,option)
+    call tcc_up%thermal_conductivity_function%CalculateFTCond( &
+         th_auxvar_up%sat,th_auxvar_up%ice%sat_ice,th_auxvar_up%temp, &
+         th_auxvar_up%effective_porosity,Dk_eff_up,dk_ds_up, &
+         dK_di_up,dk_dT_up,option)
+
+    call tcc_dn%thermal_conductivity_function% &
+         TCondTensorToScalar(dist,option)
+    call tcc_dn%thermal_conductivity_function%CalculateFTCond( &
+         th_auxvar_dn%sat,th_auxvar_dn%ice%sat_ice,th_auxvar_dn%temp, &
+         th_auxvar_dn%effective_porosity,Dk_eff_dn,dk_ds_dn, &
+         dK_di_dn,dk_dT_dn,option)
+
+  else
+
+    call tcc_up%thermal_conductivity_function% &
+         TCondTensorToScalar(dist,option)
+    call tcc_up%thermal_conductivity_function%CalculateTCond( &
+         th_auxvar_up%sat,th_auxvar_up%temp, &
+         th_auxvar_up%effective_porosity, &
+         Dk_eff_up,dk_ds_up,dk_dT_up,option)
+
+    call tcc_dn%thermal_conductivity_function% &
+         TCondTensorToScalar(dist,option)
+    call tcc_dn%thermal_conductivity_function%CalculateTCond( &
+         th_auxvar_dn%sat,th_auxvar_dn%temp,&
+         th_auxvar_dn%effective_porosity, &
+         Dk_eff_dn,dk_ds_dn,dk_dT_dn,option)
+
+  endif
+
+  Dk = (Dk_eff_up * Dk_eff_dn) / (dd_dn*Dk_eff_up + dd_up*Dk_eff_dn)
+  cond = Dk*area*(th_auxvar_up%temp - th_auxvar_dn%temp)
+
+  fluxe = fluxe + cond
+
+  ! If only solving the energy equation, ensure Res(1) is zero
+  if (option%flow%only_energy_eq) fluxm = 0.d0
+
+  Res(TH_LIQUID_EQUATION_INDEX) = fluxm
+  Res(TH_ENERGY_EQUATION_INDEX) = fluxe
+
+ ! note: Res is the flux contribution, for node 1 R = R + Res_FL
+ !                                              2 R = R - Res_FL
+
+
+end subroutine THFlux
+
+! ************************************************************************** !
+
+subroutine THBCFluxDerivative(ibndtype,bc_auxvars, &
+                              th_auxvar_up,global_auxvar_up, &
+                              th_auxvar_dn,global_auxvar_dn, &
+                              material_auxvar_dn, &
+                              Dk_dn, &
+                              area, &
+                              dist, &
+                              sir_dn, &
+                              option, &
+                              sf_dn, &
+                              cc_dn, &
+                              tcc_dn, &
+                              Dk_dry_dn, &
+                              Dk_ice_dn, &
+                              Jdn)
+  !
+  ! Computes the derivatives of the boundary flux
+  ! terms for the Jacobian
+  !
+  ! Author: ???
+  ! Date: 12/13/07
+  !
+  use Option_module
+  use Saturation_Function_module
+  use Characteristic_Curves_module
+  use Characteristic_Curves_Thermal_module
+  use Connection_module
+  use EOS_Water_module
+  use Utility_module
+
+  implicit none
+
+  PetscInt :: ibndtype(:)
+  type(th_auxvar_type) :: th_auxvar_up, th_auxvar_dn
+  type(global_auxvar_type) :: global_auxvar_up, global_auxvar_dn
+  type(material_auxvar_type) :: material_auxvar_dn
+  type(option_type) :: option
+
+  PetscReal :: sir_dn
+  PetscBool :: is_flowing
+  PetscReal :: bc_auxvars(:) ! from aux_real_var array in boundary condition
+  PetscReal :: por_dn,perm_dn,Dk_dn,tor_dn
+  PetscReal :: area
+  type(saturation_function_type), pointer :: sf_dn
+  class(characteristic_curves_type), pointer :: cc_dn
+  class(cc_thermal_type), pointer :: tcc_dn
+
+  PetscReal :: Dk_dry_dn
+  PetscReal :: Dk_ice_dn
+  PetscReal :: res(option%nflowdof)
+  PetscReal :: res_pert(option%nflowdof)
+  PetscReal :: Jdn(option%nflowdof,option%nflowdof)
+  PetscReal :: dist(-1:3)
+
+  PetscReal :: dist_gravity  ! distance along gravity vector
+
+  PetscReal :: dd_dn
+  PetscReal :: v_darcy
+  PetscReal :: fluxm,fluxe,q,density_ave
+  PetscReal :: uh,ukvr,diffdp,DK,Dq
+  PetscReal :: upweight,gravity,dphi
+
+  PetscReal :: ddiff_dp_dn, ddiff_dT_dn
+  PetscReal :: dden_ave_dp_dn, dden_ave_dT_dn
+  PetscReal :: dgravity_dden_dn
+  PetscReal :: dphi_dp_dn, dphi_dT_dn
+  PetscReal :: dukvr_dp_dn, dukvr_dT_dn
+  PetscReal :: duh_dp_dn, duh_dT_dn
+  PetscReal :: dq_dp_dn, dq_dT_dn
+  PetscReal :: Dk_eff_dn
+  PetscReal :: dk_ds_dn, dK_di_dn, dk_dT_dn
+  PetscReal :: dDk_dT_dn, dDk_dp_dn
+  PetscReal :: dKe_dT_dn, dKe_dp_dn
+  PetscReal :: dKe_fr_dT_dn, dKe_fr_dp_dn
+  PetscReal :: dummy1, dummy2
+
+#if 0
+  PetscInt :: iphase, ideriv
+  type(th_auxvar_type) :: th_auxvar_pert_dn, th_auxvar_pert_up
+  type(global_auxvar_type) :: global_auxvar_pert_dn, global_auxvar_pert_up
+  type(material_auxvar_type), allocatable :: material_auxvar_pert_dn, &
+                                              material_auxvar_pert_up
+
+  PetscReal :: perturbation
+  PetscReal :: x_up(option%nflowdof), x_dn(option%nflowdof)
+  PetscReal :: x_pert_up(option%nflowdof), x_pert_dn(option%nflowdof)
+  PetscReal :: pert_up, pert_dn
+  PetscReal :: res(option%nflowdof)
+  PetscReal :: res_pert_up(option%nflowdof)
+  PetscReal :: res_pert_dn(option%nflowdof)
+  PetscReal :: J_pert_dn(option%nflowdof,option%nflowdof)
+#endif
+
+  ! ice variables
+  PetscReal :: Ddiffgas_avg, Ddiffgas_up, Ddiffgas_dn
+  PetscReal :: p_g
+  PetscReal :: deng_up, deng_dn
+  PetscReal :: psat_up, psat_dn
+  PetscReal :: molg_up, molg_dn
+  PetscReal :: satg_up, satg_dn
+  PetscReal :: Diffg_up, Diffg_dn
+  PetscReal :: ddeng_dT_dn
+  PetscReal :: dpsat_dT_dn
+  PetscReal :: dmolg_dT_dn
+  PetscReal :: dDiffg_dT_dn
+  PetscReal :: dDiffg_dp_dn
+  PetscReal :: dsatg_dp_dn
+  PetscReal :: Diffg_ref, p_ref, T_ref
+  PetscErrorCode :: ierr
+  PetscReal :: T_th
+  PetscBool :: skip_thermal_conduction
+  PetscInt :: idof, ieq
+
+  Jdn = 0.d0
+
+  if (th_numerical_derivatives) then
+    call THBCFlux(ibndtype,bc_auxvars, &
+                  th_auxvar_up,global_auxvar_up, &
+                  th_auxvar_dn,global_auxvar_dn, &
+                  material_auxvar_dn, &
+                  Dk_dn,tcc_dn,area,dist,sir_dn, &
+                  option,v_darcy,dummy1,dummy2,res)
+    do idof = 1, option%nflowdof
+      call THBCFlux(ibndtype,bc_auxvars, &
+                    th_auxvar_up,global_auxvar_up, &
+                    th_auxvar_dn%auxvar_pert(idof),global_auxvar_dn, &
+                    material_auxvar_dn, &
+                    Dk_dn,tcc_dn,area,dist,sir_dn, &
+                    option,v_darcy,dummy1,dummy2,res_pert)
+      do ieq = 1, option%nflowdof
+        Jdn(ieq,idof) = (res_pert(ieq)-res(ieq)) / &
+                        th_auxvar_dn%auxvar_pert(idof)%pert
+      enddo
+    enddo
+    return
+  endif
+
+
+  skip_thermal_conduction = PETSC_FALSE
+  T_th  = 0.5d0
+
+  fluxm = 0.d0
+  fluxe = 0.d0
+  v_darcy = 0.d0
+  density_ave = 0.d0
+  q = 0.d0
+
+  dden_ave_dp_dn = 0.d0
+  dden_ave_dT_dn = 0.d0
+  ddiff_dp_dn = 0.d0
+  ddiff_dT_dn = 0.d0
+  dgravity_dden_dn = 0.d0
+  dphi_dp_dn = 0.d0
+  dphi_dT_dn = 0.d0
+  dukvr_dp_dn = 0.d0
+  dukvr_dT_dn = 0.d0
+  duh_dp_dn = 0.d0
+  duh_dT_dn = 0.d0
+  dq_dp_dn = 0.d0
+  dq_dT_dn = 0.d0
+
+  dist_gravity = dist(0) * dot_product(option%gravity,dist(1:3))
+  dd_dn = dist(0)
+
+  call PermeabilityTensorToScalar(material_auxvar_dn,dist,perm_dn)
+  por_dn = material_auxvar_dn%porosity_base
+  tor_dn = material_auxvar_dn%tortuosity
+
+  ! Flow
+  diffdp = por_dn*tor_dn/dd_dn*area
+  select case(ibndtype(TH_PRESSURE_DOF))
+    ! figure out the direction of flow
+    case(DIRICHLET_BC,DIRICHLET_SEEPAGE_BC,DIRICHLET_CONDUCTANCE_BC, &
+         HYDROSTATIC_BC,HYDROSTATIC_SEEPAGE_BC,HYDROSTATIC_CONDUCTANCE_BC, &
+         HET_DIRICHLET_BC,HET_HYDROSTATIC_SEEPAGE_BC, &
+         HET_HYDROSTATIC_CONDUCTANCE_BC)
+      if (ibndtype(TH_PRESSURE_DOF) == DIRICHLET_CONDUCTANCE_BC .or. &
+          ibndtype(TH_PRESSURE_DOF) == HYDROSTATIC_CONDUCTANCE_BC .or. &
+          ibndtype(TH_PRESSURE_DOF) == HET_HYDROSTATIC_CONDUCTANCE_BC) then
+        Dq = bc_auxvars(th_conductance_dof)
+      else
+        Dq = perm_dn / dd_dn
+      endif
+      ! Flow term
+      is_flowing = PETSC_FALSE
+
+      if (option%flow%th_freezing) then
+        if (th_auxvar_up%sat > sir_dn .or.  &
+            th_auxvar_dn%sat > sir_dn) then
+          is_flowing = PETSC_TRUE
+        endif
+      else
+        if (th_auxvar_up%mobility > eps .or. &
+            th_auxvar_dn%mobility > eps) then
+          is_flowing = PETSC_TRUE
+        endif
+      endif
+
+      if (is_flowing) then
+        upweight=1.D0
+        if (th_auxvar_up%sat < eps) then
+          upweight=0.d0
+        else if (th_auxvar_dn%sat < eps) then
+          upweight=1.d0
+        endif
+
+        density_ave = upweight*th_auxvar_up%den+ &
+                      (1.D0-upweight)*th_auxvar_dn%den
+        dden_ave_dp_dn = (1.D0-upweight)*th_auxvar_dn%dden_dp
+        dden_ave_dT_dn = (1.D0-upweight)*th_auxvar_dn%dden_dT
+
+        if (ibndtype(TH_TEMPERATURE_DOF) == ZERO_GRADIENT_BC) then
+          dden_ave_dT_dn = dden_ave_dT_dn + upweight*th_auxvar_up%dden_dT
+        endif
+
+        gravity = (upweight*th_auxvar_up%den*th_auxvar_up%avgmw + &
+                  (1.D0-upweight)*th_auxvar_dn%den*th_auxvar_dn%avgmw) &
+                  * dist_gravity
+        dgravity_dden_dn = (1.d0-upweight)*th_auxvar_dn%avgmw*dist_gravity
+
+        if (th_ice_model /= DALL_AMICO) then
+          dphi = th_auxvar_up%pres - th_auxvar_dn%pres + gravity
+          dphi_dp_dn = -1.d0 + dgravity_dden_dn*th_auxvar_dn%dden_dp
+          dphi_dT_dn = dgravity_dden_dn*th_auxvar_dn%dden_dT
+        else
+          dphi = th_auxvar_up%ice%pres_fh2o - th_auxvar_dn%ice%pres_fh2o + gravity
+          dphi_dp_dn = -th_auxvar_dn%ice%dpres_fh2o_dp + &
+                        dgravity_dden_dn*th_auxvar_dn%dden_dp
+          dphi_dT_dn = -th_auxvar_dn%ice%dpres_fh2o_dT + &
+                        dgravity_dden_dn*th_auxvar_dn%dden_dT
+        endif
+
+        select case(ibndtype(TH_PRESSURE_DOF))
+          case(HYDROSTATIC_SEEPAGE_BC,HYDROSTATIC_CONDUCTANCE_BC, &
+               DIRICHLET_SEEPAGE_BC,DIRICHLET_CONDUCTANCE_BC, &
+               HET_HYDROSTATIC_SEEPAGE_BC,HET_HYDROSTATIC_CONDUCTANCE_BC)
+            ! boundary cell is <= pref
+            if (th_auxvar_up%pres- &
+                option%flow%reference_pressure < eps) then
+              ! skip thermal conduction whenever water table is lower than cell
+              skip_thermal_conduction = PETSC_TRUE
+              ! flow inward
+              if (dphi > 0.d0) then
+                dphi = 0.d0
+                dphi_dp_dn = 0.d0
+                dphi_dT_dn = 0.d0
+              endif
+            endif
+        end select
+
+        if (ibndtype(TH_TEMPERATURE_DOF) == ZERO_GRADIENT_BC) then
+                     !( dgravity_dden_up                   ) (dden_dt_up)
+          dphi_dT_dn = dphi_dT_dn + upweight*th_auxvar_up%avgmw* &
+                                    dist_gravity*th_auxvar_up%dden_dT
+        endif
+
+
+        if (dphi>=0.D0) then
+          ukvr = th_auxvar_up%mobility
+          if (ibndtype(TH_TEMPERATURE_DOF) == ZERO_GRADIENT_BC) then
+            dukvr_dT_dn = th_auxvar_up%dmobility_dT
+          endif
+        else
+          ukvr = th_auxvar_dn%mobility
+          dukvr_dp_dn = th_auxvar_dn%dmobility_dp
+          dukvr_dT_dn = th_auxvar_dn%dmobility_dT
+        endif
+
+        if (ukvr*Dq>floweps) then
+          v_darcy = Dq * ukvr * dphi
+          q = v_darcy * area
+          dq_dp_dn = Dq*(dukvr_dp_dn*dphi+ukvr*dphi_dp_dn)*area
+          dq_dT_dn = Dq*(dukvr_dT_dn*dphi+ukvr*dphi_dT_dn)*area
+        endif
+      endif
+
+    case(HET_SURF_HYDROSTATIC_SEEPAGE_BC)
+      Dq = perm_dn / dd_dn
+
+      ! Flow term
+      is_flowing = PETSC_FALSE
+
+      if (option%flow%th_freezing) then
+        if (th_auxvar_up%sat > sir_dn .or.  &
+            th_auxvar_dn%sat > sir_dn) then
+          is_flowing = PETSC_TRUE
+        endif
+      else
+        if (th_auxvar_up%mobility > eps .or. &
+            th_auxvar_dn%mobility > eps) then
+          is_flowing = PETSC_TRUE
+        endif
+      endif
+
+      if (is_flowing) then
+        upweight=1.D0
+        if (th_auxvar_up%sat < eps) then
+          upweight=0.d0
+        else if (th_auxvar_dn%sat < eps) then
+          upweight=1.d0
+        endif
+
+        density_ave = upweight*th_auxvar_up%den+ &
+                      (1.D0-upweight)*th_auxvar_dn%den
+        dden_ave_dp_dn = (1.D0-upweight)*th_auxvar_dn%dden_dp
+        dden_ave_dT_dn = (1.D0-upweight)*th_auxvar_dn%dden_dT
+
+        if (ibndtype(TH_TEMPERATURE_DOF) == ZERO_GRADIENT_BC) then
+          dden_ave_dT_dn = dden_ave_dT_dn + upweight*th_auxvar_up%dden_dT
+        endif
+
+        gravity = (upweight*th_auxvar_up%den*th_auxvar_up%avgmw + &
+                  (1.D0-upweight)*th_auxvar_dn%den*th_auxvar_dn%avgmw) &
+                  * dist_gravity
+        dgravity_dden_dn = (1.d0-upweight)*th_auxvar_dn%avgmw*dist_gravity
+
+        if (th_ice_model /= DALL_AMICO) then
+          dphi = th_auxvar_up%pres - th_auxvar_dn%pres + gravity
+          dphi_dp_dn = -1.d0 + dgravity_dden_dn*th_auxvar_dn%dden_dp
+          dphi_dT_dn = dgravity_dden_dn*th_auxvar_dn%dden_dT
+        else
+          dphi = th_auxvar_up%ice%pres_fh2o - th_auxvar_dn%ice%pres_fh2o + gravity
+          dphi_dp_dn = -th_auxvar_dn%ice%dpres_fh2o_dp + &
+                       dgravity_dden_dn*th_auxvar_dn%dden_dp
+          dphi_dT_dn = -th_auxvar_dn%ice%dpres_fh2o_dT + &
+                       dgravity_dden_dn*th_auxvar_dn%dden_dT
+        endif
+
+        ! flow in         ! boundary cell is <= pref
+        if (dphi > 0.d0 .and. &
+            th_auxvar_up%pres-option%flow%reference_pressure < eps) then
+          dphi = 0.d0
+          dphi_dp_dn = 0.d0
+          dphi_dT_dn = 0.d0
+        endif
+
+        if (ibndtype(TH_TEMPERATURE_DOF) == ZERO_GRADIENT_BC) then
+                        !( dgravity_dden_up                   ) (dden_dT_up)
+          dphi_dT_dn = dphi_dT_dn + upweight*th_auxvar_up%avgmw* &
+                                    dist_gravity*th_auxvar_up%dden_dT
+        endif
+
+        if (dphi>=0.D0) then
+          ukvr = th_auxvar_up%mobility
+          if (ibndtype(TH_TEMPERATURE_DOF) == ZERO_GRADIENT_BC) then
+            dukvr_dT_dn = th_auxvar_up%dmobility_dT
+          endif
+        else
+          ukvr = th_auxvar_dn%mobility
+          dukvr_dp_dn = th_auxvar_dn%dmobility_dp
+          dukvr_dT_dn = th_auxvar_dn%dmobility_dT
+        endif
+
+        if (ukvr*Dq>floweps) then
+          v_darcy = Dq * ukvr * dphi
+          q = v_darcy * area
+          dq_dp_dn = Dq*(dukvr_dp_dn*dphi+ukvr*dphi_dp_dn)*area
+          dq_dT_dn = Dq*(dukvr_dT_dn*dphi+ukvr*dphi_dT_dn)*area
+        endif
+      endif
+
+    case(NEUMANN_BC)
+      if (dabs(bc_auxvars(TH_PRESSURE_DOF)) > floweps) then
+        v_darcy = bc_auxvars(TH_PRESSURE_DOF)
+        if (v_darcy > 0.d0) then
+          density_ave = th_auxvar_up%den
+          if (ibndtype(TH_TEMPERATURE_DOF) == ZERO_GRADIENT_BC) then
+            dden_ave_dT_dn = th_auxvar_up%dden_dT
+          endif
+        else
+          density_ave = th_auxvar_dn%den
+          dden_ave_dp_dn = th_auxvar_dn%dden_dp
+          dden_ave_dT_dn = th_auxvar_dn%dden_dT
+        endif
+        q = v_darcy * area
+      endif
+
+    case(ZERO_GRADIENT_BC)
+      ! do nothing
+
+  end select
+
+  if (v_darcy >= 0.D0) then
+    uh = th_auxvar_up%h
+    if (ibndtype(TH_PRESSURE_DOF) == ZERO_GRADIENT_BC) then
+      duh_dp_dn = th_auxvar_up%dh_dp
+    endif
+    if (ibndtype(TH_TEMPERATURE_DOF) == ZERO_GRADIENT_BC) then
+      duh_dT_dn = th_auxvar_up%dh_dT
+    endif
+  else
+    uh = th_auxvar_dn%h
+    duh_dp_dn = th_auxvar_dn%dh_dp
+    duh_dT_dn = th_auxvar_dn%dh_dT
+  endif
+
+  Jdn(TH_LIQUID_EQUATION_INDEX,TH_PRESSURE_DOF) = &
+    (dq_dp_dn*density_ave+q*dden_ave_dp_dn)
+  Jdn(TH_LIQUID_EQUATION_INDEX,TH_TEMPERATURE_DOF) = &
+    (dq_dT_dn*density_ave+q*dden_ave_dT_dn)
+
+  ! If only solving the energy equation, ensure Jdn(2,2) has no
+  ! contribution from mass equation
+  if (option%flow%only_energy_eq) then
+    q = 0.d0
+    dq_dT_dn = 0.d0
+  endif
+
+  ! based on flux = q*density_ave*uh
+  Jdn(TH_ENERGY_EQUATION_INDEX,TH_PRESSURE_DOF) =  &
+     ((dq_dp_dn*density_ave+q*dden_ave_dp_dn)*uh+q*density_ave*duh_dp_dn)
+  Jdn(TH_ENERGY_EQUATION_INDEX,TH_TEMPERATURE_DOF) =  &
+     ((dq_dT_dn*density_ave+q*dden_ave_dT_dn)*uh+q*density_ave*duh_dT_dn)
+
+  ! Conduction term
+  select case(ibndtype(TH_TEMPERATURE_DOF))
+    case(DIRICHLET_BC,HET_DIRICHLET_BC)
+      ! Dk =  th_auxvar_dn%Dk_eff / dd_dn
+      !cond = Dk*area*(th_auxvar_up%temp-th_auxvar_dn%temp)
+
+      if (skip_thermal_conduction) then
+        ! skip thermal conducton when the boundary pressure is below the
+        ! reference pressure (e.g. river stage is below cell center).
+        dDk_dT_dn = 0.d0
+        dDk_dp_dn = 0.d0
+        Dk = 0.d0
+      else
+        if (option%flow%th_freezing) then
+
+          call tcc_dn%thermal_conductivity_function% &
+               TCondTensorToScalar(dist,option)
+          call tcc_dn%thermal_conductivity_function%CalculateFTCond( &
+               th_auxvar_dn%sat,th_auxvar_dn%ice%sat_ice, &
+               th_auxvar_dn%temp,th_auxvar_dn%effective_porosity, &
+               Dk_eff_dn,dk_ds_dn,dK_di_dn,dk_dT_dn,option)
+
+          dKe_dp_dn    = th_auxvar_dn%dKe_dp
+          dKe_dT_dn    = th_auxvar_dn%dKe_dT
+          dKe_fr_dT_dn = th_auxvar_dn%ice%dKe_fr_dT
+          dKe_fr_dp_dn = th_auxvar_dn%ice%dKe_fr_dp
+          Dk           = Dk_eff_dn/dd_dn
+
+          dDk_dT_dn = Dk**2/Dk_eff_dn**2*dd_dn*(Dk_dn*dKe_dT_dn + &
+              Dk_ice_dn*dKe_fr_dT_dn + (- dKe_dT_dn - dKe_fr_dT_dn)* &
+              Dk_dry_dn)
+          dDk_dp_dn = Dk**2/Dk_eff_dn**2*dd_dn*(Dk_dn*dKe_dp_dn + &
+              Dk_ice_dn*dKe_fr_dp_dn + (- dKe_dp_dn - dKe_fr_dp_dn)* &
+              Dk_dry_dn)
+
+        else
+
+          ! Dk_eff_dn = th_auxvar_dn%Dk_eff
+
+          call tcc_dn%thermal_conductivity_function% &
+               TCondTensorToScalar(dist,option)
+          call tcc_dn%thermal_conductivity_function%CalculateTCond( &
+               th_auxvar_dn%sat,th_auxvar_dn%temp, &
+               th_auxvar_dn%effective_porosity,Dk_eff_dn,dk_ds_dn, &
+               dk_dT_dn,option)
+
+          dKe_dp_dn = th_auxvar_dn%dKe_dp
+          dKe_dT_dn = th_auxvar_dn%dKe_dT
+          Dk        = Dk_eff_dn/dd_dn
+
+          dDk_dT_dn = Dk**2/Dk_eff_dn**2*dd_dn*(Dk_dn - Dk_dry_dn)*dKe_dT_dn
+          dDk_dp_dn = Dk**2/Dk_eff_dn**2*dd_dn*(Dk_dn - Dk_dry_dn)*dKe_dp_dn
+
+        endif
+      endif
+
+      Jdn(TH_ENERGY_EQUATION_INDEX,TH_PRESSURE_DOF) = &
+        Jdn(TH_ENERGY_EQUATION_INDEX,TH_PRESSURE_DOF) + &
+              area*(th_auxvar_up%temp - th_auxvar_dn%temp)*dDk_dp_dn
+
+      Jdn(TH_ENERGY_EQUATION_INDEX,TH_TEMPERATURE_DOF) = &
+        Jdn(TH_ENERGY_EQUATION_INDEX,TH_TEMPERATURE_DOF) + Dk*area*(-1.d0) + &
+              area*(th_auxvar_up%temp - th_auxvar_dn%temp)*dDk_dT_dn
+
+      if (option%flow%th_freezing) then
+         ! Added by Satish Karra, 11/21/11
+         satg_up = th_auxvar_up%ice%sat_gas
+         satg_dn = th_auxvar_dn%ice%sat_gas
+         if ((satg_up > eps) .and. (satg_dn > eps)) then
+            p_g = option%flow%reference_pressure  ! set to reference pressure
+            deng_up = p_g/(IDEAL_GAS_CONSTANT*(th_auxvar_up%temp + &
+                 T273K))*1.d-3
+            deng_dn = p_g/(IDEAL_GAS_CONSTANT*(th_auxvar_dn%temp + &
+                 T273K))*1.d-3
+
+            ! Reference diffusivity, need to read from input file
+            Diffg_ref = 2.13D-5
+            p_ref = 1.01325d5 ! in Pa
+            T_ref = 25.d0 ! in deg C
+
+            Diffg_up = Diffg_ref*(p_ref/p_g)*((th_auxvar_up%temp + &
+                 T273K)/(T_ref + T273K))**(1.8)
+            Diffg_dn = Diffg_ref*(p_ref/p_g)*((th_auxvar_dn%temp + &
+                 T273K)/(T_ref + T273K))**(1.8)
+            Ddiffgas_up = satg_up*deng_up*Diffg_up
+            Ddiffgas_dn = satg_dn*deng_dn*Diffg_dn
+            call EOSWaterSaturationPressure(th_auxvar_up%temp, &
+                                            psat_up, ierr)
+            call EOSWaterSaturationPressure(th_auxvar_dn%temp, &
+                                            psat_dn, dpsat_dT_dn, ierr)
+            molg_up = psat_up/p_g
+            molg_dn = psat_dn/p_g
+            ddeng_dT_dn = - p_g/(IDEAL_GAS_CONSTANT*(th_auxvar_dn%temp + &
+                 T273K)**2)*1.d-3
+            dmolg_dT_dn = (1/p_g)*dpsat_dT_dn
+            dDiffg_dT_dn = 1.8*Diffg_dn/(th_auxvar_dn%temp + T273K)
+            dDiffg_dp_dn = 0.d0
+            dsatg_dp_dn = th_auxvar_dn%ice%dsat_gas_dp
+
+            if (molg_up > molg_dn) then
+               upweight = 0.d0
+            else
+               upweight = 1.d0
+            endif
+
+            Ddiffgas_avg = upweight*Ddiffgas_up+(1.D0 - upweight)*Ddiffgas_dn
+
+            Jdn(TH_LIQUID_EQUATION_INDEX,TH_PRESSURE_DOF) = &
+              Jdn(TH_LIQUID_EQUATION_INDEX,TH_PRESSURE_DOF) + por_dn*tor_dn*(1.D0 - upweight)* &
+                 Ddiffgas_dn/satg_dn*dsatg_dp_dn*(molg_up - molg_dn)/dd_dn* &
+                 area
+            Jdn(TH_LIQUID_EQUATION_INDEX,TH_TEMPERATURE_DOF) = &
+              Jdn(TH_LIQUID_EQUATION_INDEX,TH_TEMPERATURE_DOF) + por_dn*tor_dn*(1.D0 - upweight)* &
+                 (Ddiffgas_avg/deng_dn*ddeng_dT_dn + Ddiffgas_avg/Diffg_dn* &
+                 dDiffg_dT_dn)*(molg_up - molg_dn)/dd_dn*area + por_dn* &
+                 tor_dn*Ddiffgas_avg*(-dmolg_dT_dn)/dd_dn*area
+         endif
+      endif
+
+  end select
+
+  ! If only solving the energy equation,
+  !  - Set jacobian term corresponding to mass-equation to zero, and
+  !  - Set off-diagonal jacobian terms to zero.
+  if (option%flow%only_energy_eq) then
+    Jdn(TH_LIQUID_EQUATION_INDEX,TH_PRESSURE_DOF) = 0.d0
+    Jdn(TH_LIQUID_EQUATION_INDEX,TH_TEMPERATURE_DOF) = 0.d0
+    Jdn(TH_ENERGY_EQUATION_INDEX,TH_PRESSURE_DOF) = 0.d0
+  endif
+
+#if 0
+  if (option%flow%numerical_derivatives) then
+    allocate(material_auxvar_pert_up,material_auxvar_pert_dn)
+
+    call MaterialAuxVarInit(material_auxvar_pert_up,option)
+    call MaterialAuxVarInit(material_auxvar_pert_dn,option)
+
+    call GlobalAuxVarInit(global_auxvar_pert_up,option)
+    call GlobalAuxVarInit(global_auxvar_pert_dn,option)
+    call THAuxVarCopy(th_auxvar_up,th_auxvar_pert_up,option)
+    call THAuxVarCopy(th_auxvar_dn,th_auxvar_pert_dn,option)
+    call GlobalAuxVarCopy(global_auxvar_up,global_auxvar_pert_up,option)
+    call GlobalAuxVarCopy(global_auxvar_dn,global_auxvar_pert_dn,option)
+
+    call MaterialAuxVarCopy(material_auxvar_dn,material_auxvar_pert_up, &
+                            option)
+    call MaterialAuxVarCopy(material_auxvar_dn,material_auxvar_pert_dn, &
+                            option)
+
+    x_up(1) = th_auxvar_up%pres
+    x_up(2) = th_auxvar_up%temp
+    x_dn(1) = th_auxvar_dn%pres
+    x_dn(2) = th_auxvar_dn%temp
+    do ideriv = 1,3
+      if (ibndtype(ideriv) == ZERO_GRADIENT_BC) then
+        x_up(ideriv) = x_dn(ideriv)
+      endif
+    enddo
+    if (option%flow%th_freezing) then
+       call THAuxVarComputeFreezing(x_dn,th_auxvar_dn, &
+            global_auxvar_dn, &
+            material_auxvar_dn, &
+            iphase,sf_dn, &
+            th_parameter,icct_up, &
+            -999,PETSC_TRUE,option) ! do not perturb boundary porosity
+       call THAuxVarComputeFreezing(x_up,th_auxvar_up, &
+            global_auxvar_up, &
+            material_auxvar_up, &
+            iphase,sf_dn, &
+            th_parameter,icct_up, &
+            -999,PETSC_FALSE,option)
+    else
+       call THAuxVarComputeNoFreezing(x_dn,th_auxvar_dn, &
+            global_auxvar_dn, &
+            material_auxvar_dn, &
+            iphase,cc_dn, &
+            -999,PETSC_TRUE,option)
+       call THAuxVarComputeNoFreezing(x_up,th_auxvar_up, &
+            global_auxvar_up, &
+            material_auxvar_up, &
+            iphase,cc_dn, &
+            -999,PETSC_FALSE,option) ! do not perturb boundary porosity
+    endif
+
+    call THBCFlux(ibndtype,th_auxvars,th_auxvar_up,global_auxvar_up, &
+                  material_auxvar_up, &
+                  th_auxvar_dn,global_auxvar_dn, &
+                  material_auxvar_dn, &
+                  Dk_dn, tcc_dn, &
+                  area,dist_gravity,sir_dn,option,v_darcy, &
+                  fluxe_bulk, fluxe_cond, &
+                  res)
+    if (ibndtype(TH_PRESSURE_DOF) == ZERO_GRADIENT_BC .or. &
+        ibndtype(TH_TEMPERATURE_DOF) == ZERO_GRADIENT_BC ) then
+      x_pert_up = x_up
+    endif
+
+    do ideriv = 1,option%nflowdof
+      pert_dn = x_dn(ideriv)*perturbation_tolerance
+      x_pert_dn = x_dn
+
+      if (option%flow%th_freezing) then
+
+         if (ideriv == 1) then
+            if (x_pert_dn(ideriv) < option%flow%reference_pressure) then
+               pert_dn = - pert_dn
+            endif
+            x_pert_dn(ideriv) = x_pert_dn(ideriv) + pert_dn
+         endif
+
+         if (ideriv == 2) then
+            if (x_pert_dn(ideriv) < 0.d0) then
+               pert_dn = - 1.d-5
+            else
+               pert_dn = 1.d-5
+            endif
+            x_pert_dn(ideriv) = x_pert_dn(ideriv) + pert_dn
+         endif
+      else
+         x_pert_dn(ideriv) = x_pert_dn(ideriv) + pert_dn
+      endif
+
+      x_pert_up = x_up
+      if (ibndtype(ideriv) == ZERO_GRADIENT_BC) then
+        x_pert_up(ideriv) = x_pert_dn(ideriv)
+      endif
+
+      if (option%flow%th_freezing) then
+         call THAuxVarComputeFreezing(x_pert_dn,th_auxvar_pert_dn, &
+              global_auxvar_pert_dn, &
+              material_auxvar_pert_dn, &
+              iphase,sf_dn, &
+              -999,PETSC_TRUE,option)
+         call THAuxVarComputeFreezing(x_pert_up,th_auxvar_pert_up, &
+              global_auxvar_pert_up, &
+              material_auxvar_pert_up, &
+              iphase,sf_dn, &
+              -999,PETSC_FALSE,option) ! do not perturb boundary porosity
+      else
+         call THAuxVarComputeNoFreezing(x_pert_dn,th_auxvar_pert_dn, &
+              global_auxvar_pert_dn, &
+              material_auxvar_pert_dn, &
+              iphase,cc_dn, &
+              -999,PETSC_TRUE,option)
+         call THAuxVarComputeNoFreezing(x_pert_up,th_auxvar_pert_up, &
+              global_auxvar_pert_up, &
+              material_auxvar_pert_up, &
+              iphase,cc_dn, &
+              -999,PETSC_FALSE,option) ! do not perturb boundary porosity
+      endif
+
+      call THBCFlux(ibndtype,th_auxvars,th_auxvar_pert_up,global_auxvar_pert_up, &
+                    material_auxvar_pert_up, &
+                    th_auxvar_pert_dn,global_auxvar_pert_dn, &
+                    material_auxvar_pert_dn, &
+                    Dk_dn, tcc_dn, &
+                    area,dist_gravity,sir_dn,option,v_darcy, &
+                    fluxe_bulk, fluxe_cond, &
+                    res_pert_dn)
+      J_pert_dn(:,ideriv) = (res_pert_dn(:)-res(:))/pert_dn
+    enddo
+    Jdn = J_pert_dn
+    call GlobalAuxVarStrip(global_auxvar_pert_up)
+    call GlobalAuxVarStrip(global_auxvar_pert_dn)
+  endif
+#endif
+
+end subroutine THBCFluxDerivative
+
+! ************************************************************************** !
+
+subroutine THBCFlux(ibndtype,bc_auxvars, &
+                    th_auxvar_up,global_auxvar_up, &
+                    th_auxvar_dn,global_auxvar_dn, &
+                    material_auxvar_dn, &
+                    Dk_dn, tcc_dn, &
+                    area, &
+                    dist,sir_dn, &
+                    option,v_darcy, &
+                    fluxe_bulk, fluxe_cond, &
+                    Res)
+  !
+  ! Computes the  boundary flux terms for the residual
+  !
+  ! Author: ???
+  ! Date: 12/13/07
+  !
+  use Option_module
+  use Connection_module
+  use EOS_Water_module
+  use Condition_module
+  use Utility_module
+  use Characteristic_Curves_Thermal_module
+
+  implicit none
+
+  PetscInt :: ibndtype(:)
+  type(th_auxvar_type) :: th_auxvar_up, th_auxvar_dn
+  type(global_auxvar_type) :: global_auxvar_up, global_auxvar_dn
+  type(material_auxvar_type) :: material_auxvar_dn
+  class(cc_thermal_type), pointer :: tcc_dn
+  type(option_type) :: option
+  PetscReal :: sir_dn
+  PetscBool :: is_flowing
+
+  PetscReal :: bc_auxvars(:) ! from aux_real_var array
+  PetscReal :: Dk_dn
+  PetscReal :: v_darcy, area
+  PetscReal :: Res(1:option%nflowdof)
+  PetscReal :: dist(-1:3)
+  PetscReal, intent(out) :: fluxe_bulk, fluxe_cond
+
+  PetscReal :: dist_gravity  ! distance along gravity vector
+  PetscReal :: dd_dn
+
+  PetscReal :: por_dn,perm_dn,tor_dn
+  PetscReal :: fluxm,fluxe,q,density_ave
+  PetscReal :: uh,ukvr,diffdp,DK,Dq
+  PetscReal :: upweight,cond,gravity,dphi
+  PetscReal :: dk_ds_dn, dK_di_dn, dk_dT_dn
+
+  ! ice variables
+  PetscReal :: Ddiffgas_avg, Ddiffgas_dn, Ddiffgas_up
+  PetscReal :: p_g
+  PetscReal :: deng_dn, deng_up
+  PetscReal :: psat_dn, psat_up
+  PetscReal :: molg_dn, molg_up
+  PetscReal :: satg_dn, satg_up
+  PetscReal :: Diffg_dn, Diffg_up
+  PetscReal :: Diffg_ref, p_ref, T_ref
+  PetscErrorCode :: ierr
+  PetscReal :: fv_up, fv_dn
+  PetscReal :: T_th,fctT
+  PetscBool :: skip_thermal_conduction
+
+  Res = 0.d0
+
+  skip_thermal_conduction = PETSC_FALSE
+  T_th  = 0.5d0
+
+  fluxm = 0.d0
+  fluxe = 0.d0
+  v_darcy = 0.d0
+  density_ave = 0.d0
+  q = 0.d0
+  fctT = 0.d0
+  fluxe_bulk = 0.d0
+  fluxe_cond = 0.d0
+
+  dist_gravity = dist(0) * dot_product(option%gravity,dist(1:3))
+  dd_dn = dist(0)
+
+  call PermeabilityTensorToScalar(material_auxvar_dn,dist,perm_dn)
+  por_dn = material_auxvar_dn%porosity_base
+  tor_dn = material_auxvar_dn%tortuosity
+
+  ! Flow
+  diffdp = por_dn*tor_dn/dd_dn*area
+  select case(ibndtype(TH_PRESSURE_DOF))
+    case(DIRICHLET_BC,DIRICHLET_SEEPAGE_BC,DIRICHLET_CONDUCTANCE_BC, &
+         HYDROSTATIC_BC,HYDROSTATIC_SEEPAGE_BC,HYDROSTATIC_CONDUCTANCE_BC, &
+         HET_DIRICHLET_BC,HET_HYDROSTATIC_SEEPAGE_BC, &
+         HET_HYDROSTATIC_CONDUCTANCE_BC)
+      if (ibndtype(TH_PRESSURE_DOF) == DIRICHLET_CONDUCTANCE_BC .or. &
+          ibndtype(TH_PRESSURE_DOF) == HYDROSTATIC_CONDUCTANCE_BC .or. &
+          ibndtype(TH_PRESSURE_DOF) == HET_HYDROSTATIC_CONDUCTANCE_BC) then
+        Dq = bc_auxvars(th_conductance_dof)
+      else
+        Dq = perm_dn / dd_dn
+      endif
+
+      ! Flow term
+      is_flowing = PETSC_FALSE
+
+      if (option%flow%th_freezing) then
+        if (th_auxvar_up%sat > sir_dn .or.  &
+            th_auxvar_dn%sat > sir_dn) then
+          is_flowing = PETSC_TRUE
+        endif
+      else
+        if (th_auxvar_up%mobility > eps .or. &
+            th_auxvar_dn%mobility > eps) then
+          is_flowing = PETSC_TRUE
+        endif
+      endif
+
+      if (is_flowing) then
+        upweight=1.D0
+        if (th_auxvar_up%sat < eps) then
+          upweight=0.d0
+        else if (th_auxvar_dn%sat < eps) then
+          upweight=1.d0
+        endif
+        density_ave = upweight*th_auxvar_up%den+ &
+                      (1.D0-upweight)*th_auxvar_dn%den
+
+        gravity = (upweight*th_auxvar_up%den*th_auxvar_up%avgmw + &
+                  (1.D0-upweight)*th_auxvar_dn%den*th_auxvar_dn%avgmw) &
+                  * dist_gravity
+
+        if (th_ice_model /= DALL_AMICO) then
+          dphi = th_auxvar_up%pres - th_auxvar_dn%pres + gravity
+        else
+          dphi = th_auxvar_up%ice%pres_fh2o - th_auxvar_dn%ice%pres_fh2o + gravity
+        endif
+
+        select case(ibndtype(TH_PRESSURE_DOF))
+          case(HYDROSTATIC_SEEPAGE_BC,HYDROSTATIC_CONDUCTANCE_BC, &
+               DIRICHLET_SEEPAGE_BC,DIRICHLET_CONDUCTANCE_BC, &
+               HET_HYDROSTATIC_SEEPAGE_BC,HET_HYDROSTATIC_CONDUCTANCE_BC)
+            ! boundary cell is <= pref
+            if (th_auxvar_up%pres- &
+                option%flow%reference_pressure < eps) then
+              ! skip thermal conduction whenever water table is lower than cell
+              skip_thermal_conduction = PETSC_TRUE
+              ! flow inward
+              if (dphi > 0.d0) then
+                dphi = 0.d0
+              endif
+            endif
+        end select
+
+        if (dphi>=0.D0) then
+          ukvr = th_auxvar_up%mobility
+        else
+          ukvr = th_auxvar_dn%mobility
+        endif
+
+        call InterfaceApprox(th_auxvar_up%mobility, th_auxvar_dn%mobility, &
+                             dphi, &
+                             option%flow%rel_perm_aveg, &
+                             ukvr)
+
+        if (ukvr*Dq>floweps) then
+          v_darcy = Dq * ukvr * dphi
+        endif
+      endif
+
+    case(HET_SURF_HYDROSTATIC_SEEPAGE_BC)
+      Dq = perm_dn / dd_dn
+      ! Flow term
+      is_flowing = PETSC_FALSE
+
+      if (option%flow%th_freezing) then
+        if (th_auxvar_up%sat > sir_dn .or.  &
+            th_auxvar_dn%sat > sir_dn) then
+          is_flowing = PETSC_TRUE
+        endif
+      else
+        if (th_auxvar_up%mobility > eps .or. &
+            th_auxvar_dn%mobility > eps) then
+          is_flowing = PETSC_TRUE
+        endif
+      endif
+
+      if (is_flowing) then
+        upweight=1.D0
+        if (th_auxvar_up%sat < eps) then
+          upweight=0.d0
+        else if (th_auxvar_dn%sat < eps) then
+          upweight=1.d0
+        endif
+        density_ave = upweight*th_auxvar_up%den+ &
+                      (1.D0-upweight)*th_auxvar_dn%den
+
+        gravity = (upweight*th_auxvar_up%den*th_auxvar_up%avgmw + &
+             (1.D0-upweight)*th_auxvar_dn%den*th_auxvar_dn%avgmw) &
+             * dist_gravity
+
+        if (th_ice_model /= DALL_AMICO) then
+          dphi = th_auxvar_up%pres - th_auxvar_dn%pres + gravity
+        else
+          dphi = th_auxvar_up%ice%pres_fh2o - th_auxvar_dn%ice%pres_fh2o + gravity
+        endif
+
+        if (dphi > 0.d0 .and. &
+            th_auxvar_up%pres-option%flow%reference_pressure < eps) then
+          dphi = 0.d0
+        endif
+
+        if (dphi>=0.D0) then
+          ukvr = th_auxvar_up%mobility
+        else
+          ukvr = th_auxvar_dn%mobility
+        endif
+
+        call InterfaceApprox(th_auxvar_up%mobility, th_auxvar_dn%mobility, &
+             dphi, &
+             option%flow%rel_perm_aveg, &
+             ukvr)
+
+        if (ukvr*Dq>floweps) then
+          v_darcy = Dq * ukvr * dphi
+        endif
+      endif
+
+    case(NEUMANN_BC)
+      if (dabs(bc_auxvars(TH_PRESSURE_DOF)) > floweps) then
+        v_darcy = bc_auxvars(TH_PRESSURE_DOF)
+        if (v_darcy > 0.d0) then
+          density_ave = th_auxvar_up%den
+        else
+          density_ave = th_auxvar_dn%den
+        endif
+      endif
+
+    case(ZERO_GRADIENT_BC)
+      ! do nothing needed to bypass default case
+
+    case default
+      option%io_buffer = 'BC type "' // &
+        trim(FlowSubConditionGetType(ibndtype(TH_PRESSURE_DOF))) // &
+        '" not implemented in TH mode.'
+      call PrintErrMsg(option)
+
+  end select
+
+  ! If only solving the energy equation, ensure Res(2) has no
+  ! contribution from mass equation by setting darcy velocity
+  ! to be zero
+  if (option%flow%only_energy_eq) q = 0.d0
+
+  q = v_darcy * area
+
+  if (v_darcy >= 0.D0) then
+    uh = th_auxvar_up%h
+  else
+    uh = th_auxvar_dn%h
+  endif
+
+  fluxm = fluxm + q*density_ave
+  fluxe = fluxe + q*density_ave*uh
+  fluxe_bulk = q*density_ave*uh
+
+  ! Conduction term
+  select case(ibndtype(TH_TEMPERATURE_DOF))
+    case(DIRICHLET_BC,HET_DIRICHLET_BC)
+      call tcc_dn%thermal_conductivity_function% &
+      TCondTensorToScalar(dist,option)
+      if (option%flow%th_freezing) then
+        call tcc_dn%thermal_conductivity_function%CalculateFTCond( &
+        th_auxvar_dn%sat,th_auxvar_dn%ice%sat_ice, &
+        th_auxvar_dn%temp,th_auxvar_dn%effective_porosity, &
+        th_auxvar_dn%Dk_eff, &
+        dk_ds_dn,dK_di_dn,dk_dT_dn,option)
+      else
+        call tcc_dn%thermal_conductivity_function%CalculateTCond( &
+         th_auxvar_dn%sat,th_auxvar_dn%temp, &
+         th_auxvar_dn%effective_porosity, &
+         th_auxvar_dn%Dk_eff,dk_ds_dn,dk_dT_dn,option)
+      endif
+
+      Dk =  th_auxvar_dn%Dk_eff / dd_dn
+
+      cond = Dk*area*(th_auxvar_up%temp-th_auxvar_dn%temp)
+
+      if (skip_thermal_conduction) then
+        ! skip thermal conducton when the boundary pressure is below the
+        ! reference pressure (e.g. river stage is below cell center).
+        cond = 0.d0
+      endif
+
+      fluxe = fluxe + cond
+      fluxe_cond = cond
+
+      if (option%flow%th_freezing) then
+         ! Added by Satish Karra,
+         satg_up = th_auxvar_up%ice%sat_gas
+         satg_dn = th_auxvar_dn%ice%sat_gas
+         if ((satg_up > eps) .and. (satg_dn > eps)) then
+            p_g = option%flow%reference_pressure ! set to reference pressure
+            deng_up = p_g/(IDEAL_GAS_CONSTANT* &
+                      (th_auxvar_up%temp + T273K))*1.d-3
+            deng_dn = p_g/(IDEAL_GAS_CONSTANT* &
+                      (th_auxvar_dn%temp + T273K))*1.d-3
+
+            ! Reference diffusivity, need to read from input file
+            Diffg_ref = 2.13D-5
+            p_ref = 1.01325d5 ! in Pa
+            T_ref = 25.d0 ! in deg C
+
+            Diffg_up = Diffg_ref*(p_ref/p_g)*((th_auxvar_up%temp + &
+                 T273K)/(T_ref + T273K))**(1.8)
+            Diffg_dn = Diffg_ref*(p_ref/p_g)*((th_auxvar_dn%temp + &
+                 T273K)/(T_ref + T273K))**(1.8)
+            Ddiffgas_up = satg_up*deng_up*Diffg_up
+            Ddiffgas_dn = satg_dn*deng_dn*Diffg_dn
+            call EOSWaterSaturationPressure(th_auxvar_up%temp,psat_up,ierr)
+            call EOSWaterSaturationPressure(th_auxvar_dn%temp,psat_dn,ierr)
+
+            ! vapor pressure lowering due to capillary pressure
+            fv_up = exp(-th_auxvar_up%pc/(th_auxvar_up%den* &
+                 IDEAL_GAS_CONSTANT*(th_auxvar_up%temp + T273K)))
+            fv_dn = exp(-th_auxvar_dn%pc/(th_auxvar_dn%den* &
+                 IDEAL_GAS_CONSTANT*(th_auxvar_dn%temp + T273K)))
+
+            molg_up = psat_up*fv_up/p_g
+            molg_dn = psat_dn*fv_dn/p_g
+
+            if (molg_up > molg_dn) then
+               upweight = 0.d0
+            else
+               upweight = 1.d0
+            endif
+
+            Ddiffgas_avg = upweight*Ddiffgas_up + (1.D0 - upweight)*Ddiffgas_dn
+            fluxm = fluxm + por_dn*tor_dn*Ddiffgas_avg*(molg_up - molg_dn)/ &
+                 dd_dn*area
+         endif
+      endif
+
+    case(NEUMANN_BC)
+      !geh: default internal energy units are MJ
+      !       (option%scale = 1.d-6 is for J->MJ)
+      ! added by SK 10/18/11
+      fluxe = fluxe + bc_auxvars(TH_TEMPERATURE_DOF)*area*(1.d6*option%scale)
+      fluxe_cond = bc_auxvars(TH_TEMPERATURE_DOF)*area*(1.d6*option%scale)
+    case(ZERO_GRADIENT_BC)
+      ! No change in fluxe
+    case default
+      option%io_buffer = 'BC type "' // &
+        trim(FlowSubConditionGetType(ibndtype(TH_TEMPERATURE_DOF))) // &
+        '" not implemented in TH mode.'
+      call PrintErrMsg(option)
+  end select
+
+  ! If only solving the energy equation, set Res(1) is 0.d0
+  if (option%flow%only_energy_eq) fluxm = 0.d0
+
+  Res(TH_PRESSURE_DOF) = fluxm
+  Res(TH_TEMPERATURE_DOF) = fluxe
+
+end subroutine THBCFlux
+
+! ************************************************************************** !
+
+subroutine THResidual(snes,xx,r,realization,pm_well,debug,ierr)
+  !
+  ! Computes the residual equation
+  !
+  ! Author: ???
+  ! Date: 12/10/07
+  !
+
+  use Realization_Subsurface_class
+  use Patch_module
+  use Discretization_module
+  use Field_module
+  use Option_module
+  use Variables_module
+  use Material_module
+  use Debug_module
+  use Matrix_Zeroing_module
+  use PM_Well_class
+  use TH_Well_module
+
+  implicit none
+
+  SNES :: snes
+  Vec :: xx
+  Vec :: r
+  class(realization_subsurface_type) :: realization
+  class(pm_well_type), pointer :: pm_well
+  type(debug_type) :: debug
+  PetscErrorCode :: ierr
+
+  Mat :: dummy_mat
+  type(discretization_type), pointer :: discretization
+  type(field_type), pointer :: field
+  type(option_type), pointer :: option
+
+  field => realization%field
+  discretization => realization%discretization
+  option => realization%option
+
+ ! check initial guess -----------------------------------------------
+  ierr = THInitGuessCheck(xx,option)
+  if (ierr<0) then
+    call SNESSetFunctionDomainError(snes,ierr);CHKERRQ(ierr)
+    return
+  endif
+
+  call THResidualPreliminaries(xx,r,realization,pm_well,ierr)
+
+  call THResidualInternalConn(r,realization,ierr)
+  call THResidualBoundaryConn(r,realization,ierr)
+  call THResidualAccumulation(r,realization,ierr)
+  call THResidualSourceSink(r,realization,ierr)
+  call THWell(r,dummy_mat,pm_well,PETSC_FALSE)
+
+  call MatrixZeroingZeroVecEntries(realization%patch%aux%TH%matrix_zeroing,r)
+  if (associated(pm_well)) then
+    call THWellMatrixZeroing(pm_well,r,dummy_mat,PETSC_FALSE)
+  endif
+
+  if (debug%vecview_residual) then
+    call DebugVecView(debug,r,'THresidual','', &
+                      th_ts_count,th_ts_cut_count, &
+                      th_ni_count,option)
+  endif
+  if (debug%vecview_solution) then
+    call DebugVecView(debug,xx,'THxx','', &
+                      th_ts_count,th_ts_cut_count, &
+                      th_ni_count,option)
+  endif
+
+end subroutine THResidual
+
+! ************************************************************************** !
+
+subroutine THApplyPrescribedConditions(realization)
+  !
+  ! Update prescribed values in solution vector
+  !
+  ! Author: Glenn Hammond
+  ! Date: 09/16/24
+  !
+
+  use Connection_module
+  use Coupler_module
+  use Realization_Subsurface_class
+  use Patch_module
+  use Option_module
+
+  implicit none
+
+  class(realization_subsurface_type) :: realization
+
+  type(patch_type), pointer :: patch
+  type(option_type), pointer :: option
+  type(coupler_type), pointer :: cur_coupler
+  type(connection_set_type), pointer :: cur_connection_set
+  PetscInt :: local_id
+  PetscInt :: iconn, offset
+  PetscReal, pointer :: vec_ptr(:)
+  PetscErrorCode :: ierr
+
+  patch => realization%patch
+  option => realization%option
+
+  if (.not.associated(patch%prescribed_condition_list%first)) return
+
+  call VecGetArray(realization%field%flow_xx, &
+                      vec_ptr,ierr);CHKERRQ(ierr)
+
+  cur_coupler => patch%prescribed_condition_list%first
+  do
+    if (.not.associated(cur_coupler)) exit
+    cur_connection_set => cur_coupler%connection_set
+    do iconn = 1, cur_connection_set%num_connections
+      local_id = cur_connection_set%id_dn(iconn)
+      offset = (local_id-1)*option%nflowdof
+      vec_ptr(offset+TH_PRESSURE_DOF) = &
+        cur_coupler%flow_aux_real_var(TH_PRESSURE_DOF,iconn)
+      vec_ptr(offset+TH_TEMPERATURE_DOF) = &
+        cur_coupler%flow_aux_real_var(TH_TEMPERATURE_DOF,iconn)
+    enddo
+    cur_coupler => cur_coupler%next
+  enddo
+
+  call VecRestoreArray(realization%field%flow_xx, &
+                          vec_ptr,ierr);CHKERRQ(ierr)
+
+end subroutine THApplyPrescribedConditions
+
+! ************************************************************************** !
+
+subroutine THResidualPreliminaries(xx,r,realization,pm_well,ierr)
+  !
+  ! Perform preliminary work prior to residual computation
+  !
+  ! Author: Satish Karra, LANL
+  ! Date: 06/06/2019
+  !
+
+  use Connection_module
+  use Realization_Subsurface_class
+  use Patch_module
+  use Option_module
+  use PM_Well_class
+
+  implicit none
+
+  Vec, intent(inout) :: xx
+  Vec, intent(inout) :: r
+  class(realization_subsurface_type) :: realization
+  class(pm_well_type), pointer :: pm_well
+
+  type(patch_type), pointer :: patch
+  type(option_type), pointer :: option
+  PetscErrorCode :: ierr
+
+  patch => realization%patch
+  option => realization%option
+
+  call VecZeroEntries(r,ierr);CHKERRQ(ierr)
+
+  call THUpdateLocalVecs(xx,realization,ierr)
+
+  call THUpdateAuxVars(realization,pm_well)
+  ! override flags since they will soon be out of date
+  patch%aux%TH%auxvars_up_to_date = PETSC_FALSE
+
+  if (option%compute_mass_balance_new) then
+    call THZeroMassBal(realization)
+  endif
+
+end subroutine THResidualPreliminaries
+
+! ************************************************************************** !
+
+subroutine THUpdateLocalVecs(xx,realization,ierr)
+  !
+  ! Updates local vectors needed for residual computation
+  !
+  ! Author: Satish Karra, LANL
+  ! Date: 06/06/2019
+  !
+
+  use Realization_Subsurface_class
+  use Field_module
+  use Discretization_module
+  use Option_module
+  use Logging_module
+  use Material_module
+  use Material_Aux_module
+  use Variables_module
+  use Debug_module
+
+  implicit none
+
+  Vec :: xx
+  class(realization_subsurface_type) :: realization
+  PetscErrorCode :: ierr
+
+  type(discretization_type), pointer :: discretization
+  type(field_type), pointer :: field
+  type(option_type), pointer :: option
+
+  field => realization%field
+  discretization => realization%discretization
+  option => realization%option
+
+   ! Communication -----------------------------------------
+  ! These 3 must be called before THUpdateAuxVars()
+  call DiscretizationGlobalToLocal(discretization,xx,field%flow_xx_loc,NFLOWDOF)
+
+  call MaterialGetAuxVarVecLoc(realization%patch%aux%Material,field%work_loc, &
+                               PERMEABILITY_X)
+  call DiscretizationLocalToLocal(discretization,field%work_loc, &
+                                  field%work_loc,ONEDOF)
+  call MaterialSetAuxVarVecLoc(realization%patch%aux%Material,field%work_loc, &
+                               PERMEABILITY_X)
+
+  call MaterialGetAuxVarVecLoc(realization%patch%aux%Material,field%work_loc, &
+                               PERMEABILITY_Y)
+  call DiscretizationLocalToLocal(discretization,field%work_loc, &
+                                  field%work_loc,ONEDOF)
+  call MaterialSetAuxVarVecLoc(realization%patch%aux%Material,field%work_loc, &
+                               PERMEABILITY_Y)
+
+  call MaterialGetAuxVarVecLoc(realization%patch%aux%Material,field%work_loc, &
+                               PERMEABILITY_Z)
+  call DiscretizationLocalToLocal(discretization,field%work_loc, &
+                                  field%work_loc,ONEDOF)
+  call MaterialSetAuxVarVecLoc(realization%patch%aux%Material,field%work_loc, &
+                               PERMEABILITY_Z)
+
+end subroutine THUpdateLocalVecs
+
+! ************************************************************************** !
+
+subroutine THResidualInternalConn(r,realization,ierr)
+  !
+  ! Perform preliminary work prior to residual computation
+  !
+  ! Author: Satish Karra, LANL
+  ! Date: 06/06/2019
+  !
+
+  use Connection_module
+  use Realization_Subsurface_class
+  use Patch_module
+  use Grid_module
+  use Option_module
+  use Coupler_module
+  use Field_module
+  use Debug_module
+  use Characteristic_Curves_Thermal_module
+
+  implicit none
+
+  Vec :: r
+  class(realization_subsurface_type) :: realization
+
+  PetscErrorCode :: ierr
+  PetscInt :: local_id_up, local_id_dn, ghosted_id_up, ghosted_id_dn
+
+  PetscReal, pointer :: r_p(:)
+
+  PetscInt :: icc_up, icc_dn, icct_up, icct_dn
+  PetscReal :: dd_up, dd_dn
+           ! thermal conductivity wet constants at upstream, downstream faces.
+  PetscReal :: D_up, D_dn
+  PetscReal :: Dk_dry_up, Dk_dry_dn ! dry thermal conductivities
+  PetscReal :: Dk_ice_up, Dk_ice_dn ! frozen soil thermal conductivities
+  PetscReal :: alpha_up, alpha_dn
+  PetscReal :: alpha_fr_up, alpha_fr_dn
+
+  PetscReal :: upweight
+  PetscReal :: Res(realization%option%nflowdof)
+
+  type(grid_type), pointer :: grid
+  type(patch_type), pointer :: patch
+  type(option_type), pointer :: option
+  type(field_type), pointer :: field
+  type(th_parameter_type), pointer :: th_parameter
+  type(th_auxvar_type), pointer :: th_auxvars(:)
+  type(global_auxvar_type), pointer :: global_auxvars(:)
+  type(material_auxvar_type), pointer :: material_auxvars(:)
+  type(connection_set_list_type), pointer :: connection_set_list
+  type(connection_set_type), pointer :: cur_connection_set
+  class(cc_thermal_type), pointer :: tcc_dn, tcc_up
+  PetscReal :: v_darcy
+
+  PetscInt :: iconn, istart, iend
+  PetscInt :: sum_connection
+  PetscReal :: distance, fraction_upwind
+  PetscReal :: distance_gravity
+
+  patch => realization%patch
+  grid => patch%grid
+  option => realization%option
+  field => realization%field
+
+  th_parameter => patch%aux%TH%th_parameter
+  th_auxvars => patch%aux%TH%auxvars
+  global_auxvars => patch%aux%Global%auxvars
+  material_auxvars => patch%aux%Material%auxvars
+
+! now assign access pointer to local variables
+  call VecGetArray(r,r_p,ierr);CHKERRQ(ierr)
+  !print *,' Finished scattering non deriv'
+
+   ! Interior Flux Terms -----------------------------------
+  connection_set_list => grid%internal_connection_set_list
+  cur_connection_set => connection_set_list%first
+  sum_connection = 0
+  do
+    if (.not.associated(cur_connection_set)) exit
+    do iconn = 1, cur_connection_set%num_connections
+      sum_connection = sum_connection + 1
+
+      ghosted_id_up = cur_connection_set%id_up(iconn)
+      ghosted_id_dn = cur_connection_set%id_dn(iconn)
+
+      local_id_up = grid%nG2L(ghosted_id_up) ! = zero for ghost nodes
+      local_id_dn = grid%nG2L(ghosted_id_dn) ! Ghost to local mapping
+
+      if (patch%imat(ghosted_id_up) <= 0 .or.  &
+          patch%imat(ghosted_id_dn) <= 0) cycle
+
+      if (option%flow%only_vertical_flow) then
+        !geh: place second conditional within first to avoid excessive
+        !     dot products when .not. option%flow%only_vertical_flow
+        if (dot_product(cur_connection_set%dist(1:3,iconn),unit_z) < &
+            1.d-10) cycle
+      endif
+
+      fraction_upwind = cur_connection_set%dist(-1,iconn)
+      distance = cur_connection_set%dist(0,iconn)
+      ! distance = scalar - magnitude of distance
+      ! gravity = vector(3)
+      ! dist(1:3,iconn) = vector(3) - unit vector
+      distance_gravity = distance * &
+                         dot_product(option%gravity, &
+                                     cur_connection_set%dist(1:3,iconn))
+      dd_up = distance*fraction_upwind
+      dd_dn = distance-dd_up ! should avoid truncation error
+      ! upweight could be calculated as 1.d0-fraction_upwind
+      ! however, this introduces ever so slight error causing pflow-overhaul not
+      ! to match pflow-orig.  This can be changed to 1.d0-fraction_upwind
+      upweight = dd_dn/(dd_up+dd_dn)
+
+      icct_up = patch%cct_id(ghosted_id_up)
+      icct_dn = patch%cct_id(ghosted_id_dn)
+      icc_up = patch%cc_id(ghosted_id_up)
+      icc_dn = patch%cc_id(ghosted_id_dn)
+
+      D_up = th_parameter%ckwet(icct_up)
+      D_dn = th_parameter%ckwet(icct_dn)
+
+      Dk_dry_up = th_parameter%ckdry(icct_up)
+      Dk_dry_dn = th_parameter%ckdry(icct_dn)
+
+      alpha_up = th_parameter%alpha(icct_up)
+      alpha_dn = th_parameter%alpha(icct_dn)
+
+      tcc_up => patch%char_curves_thermal_array(icct_up)%ptr
+      tcc_dn => patch%char_curves_thermal_array(icct_dn)%ptr
+
+      if (option%flow%th_freezing) then
+         Dk_ice_up = th_parameter%ckfrozen(icct_up)
+         DK_ice_dn = th_parameter%ckfrozen(icct_dn)
+
+         alpha_fr_up = th_parameter%alpha_fr(icct_up)
+         alpha_fr_dn = th_parameter%alpha_fr(icct_dn)
+      else
+         Dk_ice_up = Dk_dry_up
+         Dk_ice_dn = Dk_dry_dn
+
+         alpha_fr_up = alpha_up
+         alpha_fr_dn = alpha_dn
+      endif
+
+      call THFlux(th_auxvars(ghosted_id_up),global_auxvars(ghosted_id_up), &
+                  material_auxvars(ghosted_id_up), &
+                  D_up, tcc_up, &
+                  th_auxvars(ghosted_id_dn),global_auxvars(ghosted_id_dn), &
+                  material_auxvars(ghosted_id_dn), &
+                  D_dn, tcc_dn, &
+                  cur_connection_set%area(iconn), &
+                  cur_connection_set%dist(:,iconn), &
+                  upweight,th_parameter%sir(1,icc_up), &
+                  th_parameter%sir(1,icc_dn), &
+                  option,v_darcy,Dk_dry_up, &
+                  Dk_dry_dn,Dk_ice_up,Dk_ice_dn, &
+                  alpha_up,alpha_dn,alpha_fr_up,alpha_fr_dn, &
+                  Res)
+
+      patch%internal_velocities(1,sum_connection) = v_darcy
+      patch%internal_flow_fluxes(:,sum_connection) = Res(:)
+
+      if (local_id_up>0) then
+        iend = local_id_up*option%nflowdof
+        istart = iend-option%nflowdof+1
+        r_p(istart:iend) = r_p(istart:iend) + Res(1:option%nflowdof)
+      endif
+
+      if (local_id_dn>0) then
+        iend = local_id_dn*option%nflowdof
+        istart = iend-option%nflowdof+1
+        r_p(istart:iend) = r_p(istart:iend) - Res(1:option%nflowdof)
+      endif
+
+    enddo
+    cur_connection_set => cur_connection_set%next
+  enddo
+
+  call VecRestoreArray(r,r_p,ierr);CHKERRQ(ierr)
+
+
+end subroutine THResidualInternalConn
+
+! ************************************************************************** !
+
+subroutine THResidualBoundaryConn(r,realization,ierr)
+  !
+  ! Perform preliminary work prior to residual computation
+  !
+  ! Author: Satish Karra, LANL
+  ! Date: 06/06/2019
+  !
+
+  use Connection_module
+  use Realization_Subsurface_class
+  use Patch_module
+  use Grid_module
+  use Option_module
+  use Coupler_module
+  use Field_module
+  use Debug_module
+  use Secondary_Continuum_Aux_module
+  use Secondary_Continuum_module
+  use Characteristic_Curves_Thermal_module
+
+  implicit none
+
+  Vec :: r
+  class(realization_subsurface_type) :: realization
+
+  PetscErrorCode :: ierr
+  PetscInt :: local_id, ghosted_id
+
+  PetscReal, pointer :: r_p(:)
+
+  PetscInt :: icc_dn, icct_dn
+           ! thermal conductivity wet constants at upstream, downstream faces.
+  PetscReal :: D_dn
+
+  PetscReal :: Res(realization%option%nflowdof)
+
+  type(grid_type), pointer :: grid
+  type(patch_type), pointer :: patch
+  type(option_type), pointer :: option
+  type(field_type), pointer :: field
+  type(th_parameter_type), pointer :: th_parameter
+  type(th_auxvar_type), pointer :: th_auxvars(:), th_auxvars_bc(:)
+  type(th_auxvar_type), pointer :: th_auxvars_ss(:)
+  type(global_auxvar_type), pointer :: global_auxvars(:), global_auxvars_bc(:)
+  type(global_auxvar_type), pointer :: global_auxvars_ss(:)
+  type(material_auxvar_type), pointer :: material_auxvars(:)
+  type(coupler_type), pointer :: boundary_condition
+  type(connection_set_type), pointer :: cur_connection_set
+  class(cc_thermal_type), pointer :: tcc_dn
+  PetscReal :: v_darcy
+
+  PetscInt :: iconn, istart, iend
+  PetscInt :: sum_connection
+  PetscReal :: distance_gravity
+  PetscReal :: fluxe_bulk, fluxe_cond
+
+  patch => realization%patch
+  grid => patch%grid
+  option => realization%option
+  field => realization%field
+
+  th_parameter => patch%aux%TH%th_parameter
+  th_auxvars => patch%aux%TH%auxvars
+  th_auxvars_bc => patch%aux%TH%auxvars_bc
+  th_auxvars_ss => patch%aux%TH%auxvars_ss
+  global_auxvars => patch%aux%Global%auxvars
+  global_auxvars_bc => patch%aux%Global%auxvars_bc
+  global_auxvars_ss => patch%aux%Global%auxvars_ss
+  material_auxvars => patch%aux%Material%auxvars
+
+! now assign access pointer to local variables
+  call VecGetArray(r,r_p,ierr);CHKERRQ(ierr)
+  !print *,' Finished scattering non deriv'
+
+
+  ! Boundary Flux Terms -----------------------------------
+  boundary_condition => patch%boundary_condition_list%first
+  sum_connection = 0
+  do
+    if (.not.associated(boundary_condition)) exit
+
+    cur_connection_set => boundary_condition%connection_set
+
+    do iconn = 1, cur_connection_set%num_connections
+      sum_connection = sum_connection + 1
+
+      local_id = cur_connection_set%id_dn(iconn)
+      ghosted_id = grid%nL2G(local_id)
+
+      if (patch%imat(ghosted_id) <= 0) cycle
+
+      if (ghosted_id<=0) then
+        print *, "Wrong boundary node index... STOP!!!"
+        stop
+      endif
+
+      icct_dn = patch%cct_id(ghosted_id)
+      D_dn = th_parameter%ckwet(icct_dn)
+
+      distance_gravity = cur_connection_set%dist(0,iconn) * &
+                         dot_product(option%gravity, &
+                                     cur_connection_set%dist(1:3,iconn))
+
+      icc_dn = patch%cc_id(ghosted_id)
+
+      tcc_dn => patch%char_curves_thermal_array(icct_dn)%ptr
+
+      call THBCFlux(boundary_condition%flow_condition%itype, &
+                    boundary_condition%flow_aux_real_var(:,iconn), &
+                    th_auxvars_bc(sum_connection), &
+                    global_auxvars_bc(sum_connection), &
+                    th_auxvars(ghosted_id), &
+                    global_auxvars(ghosted_id), &
+                    material_auxvars(ghosted_id), &
+                    D_dn, tcc_dn, &
+                    cur_connection_set%area(iconn), &
+                    cur_connection_set%dist(-1:3,iconn), &
+                    th_parameter%sir(1,icc_dn), &
+                    option, &
+                    v_darcy, &
+                    fluxe_bulk, fluxe_cond, &
+                    Res)
+
+      patch%boundary_velocities(1,sum_connection) = v_darcy
+      patch%boundary_flow_fluxes(:,sum_connection) = Res(:)
+
+      if (option%compute_mass_balance_new) then
+        ! contribution to boundary
+        global_auxvars_bc(sum_connection)%mass_balance_delta(1,1) = &
+          global_auxvars_bc(sum_connection)%mass_balance_delta(1,1) - Res(1)
+      endif
+
+      iend = local_id*option%nflowdof
+      istart = iend-option%nflowdof+1
+      r_p(istart:iend)= r_p(istart:iend) - Res(1:option%nflowdof)
+    enddo
+    boundary_condition => boundary_condition%next
+  enddo
+
+  call VecRestoreArray(r,r_p,ierr);CHKERRQ(ierr)
+
+end subroutine THResidualBoundaryConn
+
+! ************************************************************************** !
+
+subroutine THResidualAccumulation(r,realization,ierr)
+  !
+  ! Perform preliminary work prior to residual computation
+  !
+  ! Author: Satish Karra, LANL
+  ! Date: 06/06/2019
+  !
+
+  use Connection_module
+  use Realization_Subsurface_class
+  use Patch_module
+  use Grid_module
+  use Option_module
+  use Coupler_module
+  use Field_module
+  use Debug_module
+  use Secondary_Continuum_Aux_module
+  use Secondary_Continuum_module
+  use Geomechanics_Linear_Aux_module
+
+  implicit none
+
+  Vec :: r
+  class(realization_subsurface_type) :: realization
+
+  PetscErrorCode :: ierr
+  PetscInt :: local_id, ghosted_id
+
+  PetscReal, pointer :: accum_t_p(:)
+  PetscReal, pointer :: accum_tpdt_p(:)
+  PetscReal, pointer :: r_p(:)
+
+  PetscReal :: Res(realization%option%nflowdof)
+
+  type(grid_type), pointer :: grid
+  type(patch_type), pointer :: patch
+  type(option_type), pointer :: option
+  type(field_type), pointer :: field
+  type(th_parameter_type), pointer :: th_parameter
+  type(th_auxvar_type), pointer :: th_auxvars(:)
+  type(global_auxvar_type), pointer :: global_auxvars(:)
+  type(material_auxvar_type), pointer :: material_auxvars(:)
+  type(sec_heat_type), pointer :: TH_sec_heat_vars(:)
+
+  PetscInt :: istart, iend
+  PetscReal :: vol_frac_prim
+
+  ! secondary continuum variables
+  PetscReal :: sec_dencpr
+  PetscReal :: res_sec_heat
+  PetscInt :: icct
+
+  patch => realization%patch
+  grid => patch%grid
+  option => realization%option
+  field => realization%field
+
+  th_parameter => patch%aux%TH%th_parameter
+  th_auxvars => patch%aux%TH%auxvars
+  global_auxvars => patch%aux%Global%auxvars
+  material_auxvars => patch%aux%Material%auxvars
+  TH_sec_heat_vars => patch%aux%SC_heat%sec_heat_vars
+
+! now assign access pointer to local variables
+  call VecGetArray(r,r_p,ierr);CHKERRQ(ierr)
+  call VecGetArray(field%flow_accum_tpdt,accum_tpdt_p,ierr);CHKERRQ(ierr)
+  !print *,' Finished scattering non deriv'
+
+  ! Calculating volume fractions for primary and secondary continua
+
+  vol_frac_prim = 1.d0
+
+  ! Accumulation terms ------------------------------------
+  call VecGetArrayRead(field%flow_accum_t,accum_t_p,ierr);CHKERRQ(ierr)
+  r_p = r_p - accum_t_p
+  call VecRestoreArrayRead(field%flow_accum_t,accum_t_p,ierr);CHKERRQ(ierr)
+
+  do local_id = 1, grid%nlmax  ! For each local node do...
+    ghosted_id = grid%nL2G(local_id)
+    if (patch%imat(ghosted_id) <= 0) cycle
+    iend = local_id*option%nflowdof
+    istart = iend-option%nflowdof+1
+
+    if (option%use_sc) then
+      vol_frac_prim = material_auxvars(ghosted_id)%secondary_prop%epsilon
+    endif
+
+    ! non-fixed here
+    option%iflag = TH_UPDATE_FOR_ACCUM
+    call THAccumulation(th_auxvars(ghosted_id),global_auxvars(ghosted_id), &
+                        material_auxvars(ghosted_id), &
+                        th_parameter, &
+                        th_parameter%dencpr(patch%cct_id(ghosted_id)), &
+                        option,vol_frac_prim,Res)
+    r_p(istart:iend) = r_p(istart:iend) + Res
+    accum_tpdt_p(istart:iend) = Res
+  enddo
+
+  ! ================== Secondary continuum heat source terms ==================
+  if (option%use_sc) then
+  ! Secondary continuum contribution (Added by SK 06/02/2012)
+  ! only one secondary continuum for now for each primary continuum node
+    do local_id = 1, grid%nlmax  ! For each local node do...
+      ghosted_id = grid%nL2G(local_id)
+      if (patch%imat(ghosted_id) <= 0) cycle
+      if (Equal((material_auxvars(ghosted_id)% &
+          secondary_prop%epsilon),1.d0)) cycle
+      iend = local_id*option%nflowdof
+
+      ! secondary rho*c_p same as primary for now
+      icct = patch%cct_id(ghosted_id)
+      sec_dencpr = th_parameter%dencpr(icct)
+
+      call SecondaryHeatResidual(TH_sec_heat_vars(local_id), &
+                                 th_parameter%ckwet(icct), &
+                                 sec_dencpr,th_auxvars(ghosted_id)%temp, &
+                                 option,res_sec_heat)
+
+      r_p(iend) = r_p(iend) - res_sec_heat*material_auxvars(ghosted_id)%volume
+    enddo
+  endif
+
+  call VecRestoreArray(r,r_p,ierr);CHKERRQ(ierr)
+  call VecRestoreArray(field%flow_accum_tpdt,accum_tpdt_p,ierr);CHKERRQ(ierr)
+
+end subroutine THResidualAccumulation
+
+! ************************************************************************** !
+
+subroutine THResidualSourceSink(r,realization,ierr)
+  !
+  ! Perform preliminary work prior to residual computation
+  !
+  ! Author: Satish Karra, LANL
+  ! Date: 06/06/2019
+  !
+
+  use Connection_module
+  use Realization_Subsurface_class
+  use Patch_module
+  use Grid_module
+  use Option_module
+  use Coupler_module
+  use Field_module
+  use Debug_module
+  use Utility_module, only : Smoothstep
+
+  implicit none
+
+  Vec :: r
+  class(realization_subsurface_type) :: realization
+
+  PetscErrorCode :: ierr
+  PetscInt :: local_id, ghosted_id
+
+  PetscReal, pointer :: r_p(:)
+  PetscReal, pointer :: xx_loc_p(:), yy_p(:)
+
+  PetscReal :: Res_src(realization%option%nflowdof)
+  PetscReal :: Jdummy(realization%option%nflowdof,realization%option%nflowdof)
+
+  type(grid_type), pointer :: grid
+  type(patch_type), pointer :: patch
+  type(option_type), pointer :: option
+  type(field_type), pointer :: field
+  type(th_parameter_type), pointer :: th_parameter
+  type(th_auxvar_type), pointer :: th_auxvars(:), th_auxvars_bc(:)
+  type(th_auxvar_type), pointer :: th_auxvars_ss(:)
+  type(global_auxvar_type), pointer :: global_auxvars(:), global_auxvars_bc(:)
+  type(global_auxvar_type), pointer :: global_auxvars_ss(:)
+  type(material_auxvar_type), pointer :: material_auxvars(:)
+  type(coupler_type), pointer :: source_sink
+  type(connection_set_type), pointer :: cur_connection_set
+  PetscReal :: qsrc_kmol
+
+  PetscReal, pointer :: flow_array(:)
+  PetscReal, pointer :: energy_array(:)
+
+  PetscInt :: iconn, istart, iend
+  PetscInt :: sum_connection
+
+  patch => realization%patch
+  grid => patch%grid
+  option => realization%option
+  field => realization%field
+
+  th_parameter => patch%aux%TH%th_parameter
+  th_auxvars => patch%aux%TH%auxvars
+  th_auxvars_bc => patch%aux%TH%auxvars_bc
+  th_auxvars_ss => patch%aux%TH%auxvars_ss
+  global_auxvars => patch%aux%Global%auxvars
+  global_auxvars_bc => patch%aux%Global%auxvars_bc
+  global_auxvars_ss => patch%aux%Global%auxvars_ss
+  material_auxvars => patch%aux%Material%auxvars
+
+! now assign access pointer to local variables
+  call VecGetArray(r,r_p,ierr);CHKERRQ(ierr)
+  call VecGetArray(field%flow_xx_loc,xx_loc_p,ierr);CHKERRQ(ierr)
+  call VecGetArray(field%flow_yy,yy_p,ierr);CHKERRQ(ierr)
+
+  ! Source/sink terms -------------------------------------
+  source_sink => patch%source_sink_list%first
+  sum_connection = 0
+  do
+    if (.not.associated(source_sink)) exit
+
+    cur_connection_set => source_sink%connection_set
+
+    flow_array => source_sink%flow_condition%rate%dataset%rarray
+    nullify(energy_array)
+    if (associated(source_sink%flow_condition%energy_rate)) then
+      energy_array => source_sink%flow_condition%energy_rate%dataset%rarray
+    endif
+
+    do iconn = 1, cur_connection_set%num_connections
+      sum_connection = sum_connection + 1
+      local_id = cur_connection_set%id_dn(iconn)
+      iend = local_id * option%nflowdof
+      istart = iend - option%nflowdof + 1
+      ghosted_id = grid%nL2G(local_id)
+      if (patch%imat(ghosted_id) <= 0) cycle
+
+      call THSourceSink(source_sink%flow_condition%itype, &
+                        source_sink%flow_condition%rate%itype, &
+                        flow_array,energy_array, &
+                        th_auxvars(ghosted_id),th_auxvars_ss(iconn), &
+                        material_auxvars(ghosted_id), &
+                        source_sink%flow_aux_real_var(:,iconn), &
+                        source_sink%flow_condition%rate%aux_real(:), &
+                        Res_src,Jdummy, &
+                        qsrc_kmol, &
+                        PETSC_FALSE,option)
+
+      r_p(istart:iend) = r_p(istart:iend) - Res_src
+
+      if (option%compute_mass_balance_new) then
+        global_auxvars_ss(sum_connection)%mass_balance_delta(1,1) = &
+          global_auxvars_ss(sum_connection)%mass_balance_delta(1,1) - Res_src(1)
+      endif
+      if (associated(patch%ss_flow_vol_fluxes)) then
+        ! fluid flux [m^3/sec] = qsrc_kmol [kmol/sec] / den [kmol/m^3]
+        patch%ss_flow_vol_fluxes(1,sum_connection) = qsrc_kmol / &
+                                           th_auxvars(ghosted_id)%den
+      endif
+      if (associated(patch%ss_flow_fluxes)) then
+        patch%ss_flow_fluxes(:,sum_connection) = Res_src(:)
+      endif
+
+
+    enddo
+    source_sink => source_sink%next
+  enddo
+
+  if (th_scale_by_volume) then
+    ! scale the residual by the volume
+    do local_id = 1, grid%nlmax
+      ghosted_id = grid%nL2G(local_id)
+      if (patch%imat(ghosted_id) <= 0) cycle
+      iend = local_id*option%nflowdof
+      istart = iend-option%nflowdof+1
+      iend = istart + 1 ! kludge to avoid th_well_dof
+      r_p (istart:iend)= r_p(istart:iend)/material_auxvars(ghosted_id)%volume
+    enddo
+  endif
+
+  if (option%flow%isothermal) then
+    do local_id = 1, grid%nlmax  ! For each local node do...
+      ghosted_id = grid%nL2G(local_id)
+      if (patch%imat(ghosted_id) <= 0) cycle
+      istart = TWO_INTEGER + (local_id-1)*option%nflowdof
+      r_p(istart)=xx_loc_p(2 + (ghosted_id-1)*option%nflowdof)-yy_p(istart-1)
+    enddo
+  endif
+
+  call VecRestoreArray(r,r_p,ierr);CHKERRQ(ierr)
+  call VecRestoreArray(field%flow_xx_loc,xx_loc_p,ierr);CHKERRQ(ierr)
+  call VecRestoreArray(field%flow_yy,yy_p,ierr);CHKERRQ(ierr)
+
+end subroutine THResidualSourceSink
+
+! ************************************************************************** !
+
+subroutine THJacobian(snes,xx,A,B,realization,pm_well,debug,ierr)
+  !
+  ! Computes the Jacobian
+  !
+  ! Author: ???
+  ! Date: 12/10/07
+  ! Refactored by Satish Karra, LANL 06/12/2019
+
+  use Realization_Subsurface_class
+  use Patch_module
+  use Grid_module
+  use Option_module
+  use Debug_module
+  use Matrix_Zeroing_module
+  use PM_Well_class
+  use TH_Well_module
+
+  implicit none
+
+  SNES :: snes
+  Vec :: xx
+  Mat :: A, B
+  class(realization_subsurface_type) :: realization
+  class(pm_well_type), pointer :: pm_well
+  type(debug_type) :: debug
+  PetscErrorCode :: ierr
+
+  Mat :: J
+  Vec :: r_dummy
+  MatType :: mat_type
+  type(option_type),  pointer :: option
+  PetscReal :: norm
+
+  option => realization%option
+
+  call MatGetType(A,mat_type,ierr);CHKERRQ(ierr)
+  if (mat_type == MATMFFD) then
+    J = B
+    call MatAssemblyBegin(A,MAT_FINAL_ASSEMBLY,ierr);CHKERRQ(ierr)
+    call MatAssemblyEnd(A,MAT_FINAL_ASSEMBLY,ierr);CHKERRQ(ierr)
+  else
+    J = A
+  endif
+
+  call MatZeroEntries(J,ierr);CHKERRQ(ierr)
+
+#if 0
+   call THNumericalJacobianTest(xx,J,realization,pm_well,debug)
+#endif
+
+  if (th_numerical_derivatives) then
+    call THPerturb(realization,pm_well)
+  endif
+
+  call THJacobianInternalConn(J,realization,debug,ierr)
+  call THJacobianBoundaryConn(J,realization,debug,ierr)
+  call THJacobianAccumulation(J,realization,debug,ierr)
+  call THJacobianSourceSink(J,realization,debug,ierr)
+  call THWell(r_dummy,J,pm_well,PETSC_TRUE)
+
+  call MatAssemblyBegin(J,MAT_FINAL_ASSEMBLY,ierr);CHKERRQ(ierr)
+  call MatAssemblyEnd(J,MAT_FINAL_ASSEMBLY,ierr);CHKERRQ(ierr)
+
+! zero out isothermal and inactive cells
+#ifdef ISOTHERMAL_MODE_DOES_NOT_WORK
+  do i=1, patch%aux%TH%matrix_zeroing%n_zero_rows
+    ii = mod(patch%aux%TH%matrix_zeroing%zero_rows_local(i),option%nflowdof)
+    ip1 = patch%aux%TH%matrix_zeroing%zero_rows_local_ghosted(i)
+    if (ii == 0) then
+      ip2 = ip1-1
+    else if (ii == option%nflowdof-1) then
+      ip2 = ip1+1
+    else
+      ip2 = ip1
+    endif
+    call PUMSetValuesLocal(J,1,ip1,1,ip2,1.d0,INSERT_VALUES, &
+                           ierr);CHKERRQ(ierr)
+  enddo
+
+  call MatAssemblyBegin(J,MAT_FINAL_ASSEMBLY,ierr);CHKERRQ(ierr)
+  call MatAssemblyEnd(J,MAT_FINAL_ASSEMBLY,ierr);CHKERRQ(ierr)
+#endif
+
+  call MatrixZeroingZeroMatEntries(realization%patch%aux%TH%matrix_zeroing,J)
+  if (associated(pm_well)) then
+    call THWellMatrixZeroing(pm_well,r_dummy,J,PETSC_TRUE)
+  endif
+
+  if (debug%matview_Matrix) then
+    call DebugMatView(debug,J,'THjacobian','', &
+                      th_ts_count,th_ts_cut_count, &
+                      th_ni_count,option)
+  endif
+  if (debug%norm_Matrix) then
+    option => realization%option
+    call MatNorm(J,NORM_1,norm,ierr);CHKERRQ(ierr)
+    write(option%io_buffer,'("1 norm: ",es11.4)') norm
+    call PrintMsg(option)
+    call MatNorm(J,NORM_FROBENIUS,norm,ierr);CHKERRQ(ierr)
+    write(option%io_buffer,'("2 norm: ",es11.4)') norm
+    call PrintMsg(option)
+    call MatNorm(J,NORM_INFINITY,norm,ierr);CHKERRQ(ierr)
+    write(option%io_buffer,'("inf norm: ",es11.4)') norm
+    call PrintMsg(option)
+  endif
+
+  th_ni_count = th_ni_count + 1
+
+end subroutine THJacobian
+
+! ************************************************************************** !
+
+subroutine THPerturb(realization,pm_well)
+  !
+  ! Perturbs primary dofs for numerical derivatives
+  !
+  ! Author: Glenn Hammond
+  ! Date: 08/11/25
+
+  use Option_module
+  use Grid_module
+  use Realization_Subsurface_class
+  use Patch_module
+  use Characteristic_Curves_module
+  use Characteristic_Curves_Thermal_module
+  use PM_Well_class
+
+  class(realization_subsurface_type) :: realization
+  class(pm_well_type), pointer :: pm_well
+
+  type(grid_type), pointer :: grid
+  type(patch_type), pointer :: patch
+  type(option_type), pointer :: option
+  type(th_parameter_type), pointer :: th_parameter
+  type(th_auxvar_type), pointer :: th_auxvars(:)
+  type(global_auxvar_type), pointer :: global_auxvars(:)
+  type(material_auxvar_type), pointer :: material_auxvars(:)
+  class(characteristic_curves_type), pointer :: characteristic_curves
+  class(cc_thermal_type), pointer :: thermal_cc
+  PetscInt :: ghosted_id
+  PetscInt :: natural_id
+  PetscInt :: icct
+
+  patch => realization%patch
+  grid => patch%grid
+  option => realization%option
+
+  th_parameter => patch%aux%TH%th_parameter
+  th_auxvars => patch%aux%TH%auxvars
+  global_auxvars => patch%aux%Global%auxvars
+  material_auxvars => patch%aux%Material%auxvars
+
+  ! Perturb aux vars
+  do ghosted_id = 1, grid%ngmax  ! For each local node do...
+    if (patch%imat(ghosted_id) <= 0) cycle
+    natural_id = grid%nG2A(ghosted_id)
+    characteristic_curves => &
+      patch%characteristic_curves_array(patch%cc_id(ghosted_id))%ptr
+    icct = patch%cct_id(ghosted_id)
+    thermal_cc => patch%char_curves_thermal_array(icct)%ptr
+    call THAuxVarPerturb(th_auxvars(ghosted_id), &
+                         global_auxvars(ghosted_id), &
+                         material_auxvars(ghosted_id), &
+                         global_auxvars(ghosted_id)%istate, &
+                         characteristic_curves, &
+                         thermal_cc,th_parameter,icct, &
+                         natural_id,PETSC_FALSE,option)
+  enddo
+
+  call THWellPerturb(pm_well)
+
+end subroutine THPerturb
+
+! ************************************************************************** !
+
+subroutine THJacobianInternalConn(A,realization,debug,ierr)
+  !
+  ! Computes the jacobian contribution from internal flux
+  !
+  ! Author: ??
+  ! Date: 12/13/07
+  ! Refactored by Satish Karra, LANL 06/12/2019
+  !
+
+
+  use Connection_module
+  use Option_module
+  use Grid_module
+  use Realization_Subsurface_class
+  use Patch_module
+  use Coupler_module
+  use Field_module
+  use Debug_module
+  use Secondary_Continuum_Aux_module
+  use Saturation_Function_module
+  use Characteristic_Curves_module
+  use Characteristic_Curves_Thermal_module
+  use Petsc_Utility_module
+
+  Mat :: A
+  class(realization_subsurface_type) :: realization
+  type(debug_type) :: debug
+
+  PetscErrorCode :: ierr
+  PetscInt :: icct_up, icct_dn
+
+  PetscReal, pointer :: xx_loc_p(:)
+  PetscInt :: icc_up, icc_dn
+  PetscReal :: dd_up, dd_dn
+  ! thermal conductivity wet constants at upstream, downstream faces.
+  PetscReal :: D_up, D_dn
+  PetscReal :: Dk_dry_up, Dk_dry_dn ! dry thermal conductivities
+  PetscReal :: Dk_ice_up, Dk_ice_dn ! frozen soil thermal conductivities
+  PetscReal :: alpha_up, alpha_dn
+  PetscReal :: alpha_fr_up, alpha_fr_dn
+  PetscReal :: upweight
+  PetscInt :: local_id_up, local_id_dn
+  PetscInt :: ghosted_id_up, ghosted_id_dn
+
+  PetscReal :: Jup(realization%option%nflowdof,realization%option%nflowdof), &
+               Jdn(realization%option%nflowdof,realization%option%nflowdof), &
+               Jtmp(realization%option%nflowdof,realization%option%nflowdof)
+
+  type(connection_set_list_type), pointer :: connection_set_list
+  type(connection_set_type), pointer :: cur_connection_set
+  PetscInt :: iconn
+  PetscInt :: sum_connection
+  PetscReal :: distance, fraction_upwind
+  PetscReal :: distance_gravity
+  type(grid_type), pointer :: grid
+  type(patch_type), pointer :: patch
+  type(option_type), pointer :: option
+  type(field_type), pointer :: field
+  type(th_parameter_type), pointer :: th_parameter
+  type(th_auxvar_type), pointer :: th_auxvars(:)
+  type(global_auxvar_type), pointer :: global_auxvars(:)
+  type(material_auxvar_type), pointer :: material_auxvars(:)
+  type(saturation_function_type), pointer :: sf_up
+  type(saturation_function_type), pointer :: sf_dn
+  class(characteristic_curves_type), pointer :: cc_up, cc_dn
+  class(cc_thermal_type), pointer :: tcc_up, tcc_dn
+
+  patch => realization%patch
+  grid => patch%grid
+  option => realization%option
+  field => realization%field
+
+  th_parameter => patch%aux%TH%th_parameter
+  th_auxvars => patch%aux%TH%auxvars
+  global_auxvars => patch%aux%Global%auxvars
+  material_auxvars => patch%aux%Material%auxvars
+
+  call VecGetArray(field%flow_xx_loc,xx_loc_p,ierr);CHKERRQ(ierr)
+
+  ! Interior Flux Terms -----------------------------------
+  connection_set_list => grid%internal_connection_set_list
+  cur_connection_set => connection_set_list%first
+  sum_connection = 0
+  do
+    if (.not.associated(cur_connection_set)) exit
+    do iconn = 1, cur_connection_set%num_connections
+      sum_connection = sum_connection + 1
+
+      ghosted_id_up = cur_connection_set%id_up(iconn)
+      ghosted_id_dn = cur_connection_set%id_dn(iconn)
+
+      if (patch%imat(ghosted_id_up) <= 0 .or. &
+          patch%imat(ghosted_id_dn) <= 0) cycle
+
+      if (option%flow%only_vertical_flow) then
+        !geh: place second conditional within first to avoid excessive
+        !     dot products when .not. option%flow%only_vertical_flow
+        if (dot_product(cur_connection_set%dist(1:3,iconn),unit_z) < &
+            1.d-10) cycle
+      endif
+
+      local_id_up = grid%nG2L(ghosted_id_up) ! = zero for ghost nodes
+      local_id_dn = grid%nG2L(ghosted_id_dn) ! Ghost to local mapping
+
+      fraction_upwind = cur_connection_set%dist(-1,iconn)
+      distance = cur_connection_set%dist(0,iconn)
+      ! distance = scalar - magnitude of distance
+      ! gravity = vector(3)
+      ! dist(1:3,iconn) = vector(3) - unit vector
+      distance_gravity = distance * &
+                         dot_product(option%gravity, &
+                                     cur_connection_set%dist(1:3,iconn))
+      dd_up = distance*fraction_upwind
+      dd_dn = distance-dd_up ! should avoid truncation error
+      ! upweight could be calculated as 1.d0-fraction_upwind
+      ! however, this introduces ever so slight error causing pflow-overhaul not
+      ! to match pflow-orig.  This can be changed to 1.d0-fraction_upwind
+      upweight = dd_dn/(dd_up+dd_dn)
+
+      icct_up = patch%cct_id(ghosted_id_up)
+      icct_dn = patch%cct_id(ghosted_id_dn)
+
+      D_up = th_parameter%ckwet(icct_up)
+      D_dn = th_parameter%ckwet(icct_dn)
+
+      Dk_dry_up = th_parameter%ckdry(icct_up)
+      Dk_dry_dn = th_parameter%ckdry(icct_dn)
+
+      alpha_up = th_parameter%alpha(icct_up)
+      alpha_dn = th_parameter%alpha(icct_dn)
+
+      icc_up = patch%cc_id(ghosted_id_up)
+      icc_dn = patch%cc_id(ghosted_id_dn)
+
+      if (option%flow%th_freezing) then
+         Dk_ice_up = th_parameter%ckfrozen(icct_up)
+         DK_ice_dn = th_parameter%ckfrozen(icct_dn)
+
+         alpha_fr_up = th_parameter%alpha_fr(icct_up)
+         alpha_fr_dn = th_parameter%alpha_fr(icct_dn)
+
+         sf_up => patch%saturation_function_array(icc_up)%ptr
+         sf_dn => patch%saturation_function_array(icc_dn)%ptr
+      else
+         Dk_ice_up = Dk_dry_up
+         Dk_ice_dn = Dk_dry_dn
+
+         alpha_fr_up = alpha_up
+         alpha_fr_dn = alpha_dn
+
+         cc_up => patch%characteristic_curves_array(icc_up)%ptr
+         cc_dn => patch%characteristic_curves_array(icc_dn)%ptr
+      endif
+
+      tcc_up => patch%char_curves_thermal_array(icct_up)%ptr
+      tcc_dn => patch%char_curves_thermal_array(icct_dn)%ptr
+
+      call THFluxDerivative(th_auxvars(ghosted_id_up), &
+                            global_auxvars(ghosted_id_up), &
+                            material_auxvars(ghosted_id_up), &
+                            D_up, &
+                            icct_up, &
+                            th_auxvars(ghosted_id_dn), &
+                            global_auxvars(ghosted_id_dn), &
+                            material_auxvars(ghosted_id_dn), &
+                            D_dn, &
+                            icct_dn, &
+                            cur_connection_set%area(iconn), &
+                            cur_connection_set%dist(-1:3,iconn), &
+                            upweight, &
+                            th_parameter%sir(1,icc_up), &
+                            th_parameter%sir(1,icc_dn), &
+                            option, &
+                            sf_up,sf_dn,cc_up,cc_dn,tcc_up,tcc_dn, &
+                            Dk_dry_up,Dk_dry_dn, &
+                            Dk_ice_up,Dk_ice_dn, &
+                            alpha_up,alpha_dn,alpha_fr_up,alpha_fr_dn, &
+                            th_parameter, &
+                            Jup,Jdn)
+
+      if (local_id_up > 0) then
+        Jtmp = Jup
+        if (th_scale_by_volume)then
+          Jtmp = Jtmp/material_auxvars(ghosted_id_up)%volume
+        endif
+        call PUMSetValuesBlockedLocal(A,1,ghosted_id_up-1,1,ghosted_id_up-1, &
+                                      Jtmp,ADD_VALUES,ierr);CHKERRQ(ierr)
+        Jtmp = Jdn
+        if (th_scale_by_volume)then
+          Jtmp = Jtmp/material_auxvars(ghosted_id_up)%volume
+        endif
+        call PUMSetValuesBlockedLocal(A,1,ghosted_id_up-1,1,ghosted_id_dn-1, &
+                                      Jtmp,ADD_VALUES,ierr);CHKERRQ(ierr)
+      endif
+      if (local_id_dn > 0) then
+        Jup = -Jup
+        Jdn = -Jdn
+
+        Jtmp = Jdn
+        if (th_scale_by_volume)then
+          Jtmp = Jtmp/material_auxvars(ghosted_id_dn)%volume
+        endif
+        call PUMSetValuesBlockedLocal(A,1,ghosted_id_dn-1,1,ghosted_id_dn-1, &
+                                      Jtmp,ADD_VALUES,ierr);CHKERRQ(ierr)
+        Jtmp = Jup
+        if (th_scale_by_volume)then
+          Jtmp = Jtmp/material_auxvars(ghosted_id_dn)%volume
+        endif
+        call PUMSetValuesBlockedLocal(A,1,ghosted_id_dn-1,1,ghosted_id_up-1, &
+                                      Jtmp,ADD_VALUES,ierr);CHKERRQ(ierr)
+
+      endif
+    enddo
+    cur_connection_set => cur_connection_set%next
+  enddo
+
+  if (debug%matview_Matrix_detailed) then
+    call MatAssemblyBegin(A,MAT_FINAL_ASSEMBLY,ierr);CHKERRQ(ierr)
+    call MatAssemblyEnd(A,MAT_FINAL_ASSEMBLY,ierr);CHKERRQ(ierr)
+    call DebugMatView(debug,A,'jacobian_flux.out',option)
+  endif
+
+
+end subroutine THJacobianInternalConn
+
+! ************************************************************************** !
+
+subroutine THJacobianBoundaryConn(A,realization,debug,ierr)
+  !
+  ! Computes the jacobian contribution from boundary flux
+  !
+  ! Author: ??
+  ! Date: 12/13/07
+  ! Refactored by Satish Karra, LANL 06/12/2019
+  !
+
+
+  use Connection_module
+  use Option_module
+  use Grid_module
+  use Realization_Subsurface_class
+  use Patch_module
+  use Coupler_module
+  use Field_module
+  use Debug_module
+  use Secondary_Continuum_Aux_module
+  use Saturation_Function_module
+  use Characteristic_Curves_module
+  use Characteristic_Curves_Thermal_module
+  use Petsc_Utility_module
+
+  Mat :: A
+  class(realization_subsurface_type) :: realization
+  type(debug_type) :: debug
+  PetscErrorCode :: ierr
+
+  PetscInt :: icct_dn
+
+  PetscReal, pointer :: xx_loc_p(:)
+  PetscInt :: icc_dn
+  ! thermal conductivity wet constants at upstream, downstream faces.
+  PetscReal :: D_dn
+  PetscReal :: Dk_dry_dn ! dry thermal conductivities
+  PetscReal :: Dk_ice_dn ! frozen soil thermal conductivities
+  PetscReal :: alpha_dn
+  PetscReal :: alpha_fr_dn
+  PetscInt :: local_id, ghosted_id
+
+  PetscReal :: Jdn(realization%option%nflowdof,realization%option%nflowdof)
+
+  type(coupler_type), pointer :: boundary_condition
+  type(connection_set_type), pointer :: cur_connection_set
+  PetscInt :: iconn
+  PetscInt :: sum_connection
+  type(grid_type), pointer :: grid
+  type(patch_type), pointer :: patch
+  type(option_type), pointer :: option
+  type(field_type), pointer :: field
+  type(th_parameter_type), pointer :: th_parameter
+  type(th_auxvar_type), pointer :: th_auxvars_bc(:), th_auxvars(:)
+  type(global_auxvar_type), pointer :: global_auxvars(:), global_auxvars_bc(:)
+  type(material_auxvar_type), pointer :: material_auxvars(:)
+  type(saturation_function_type), pointer :: sf_dn
+  class(characteristic_curves_type), pointer :: cc_dn
+  class(cc_thermal_type), pointer :: tcc_dn
+
+  patch => realization%patch
+  grid => patch%grid
+  option => realization%option
+  field => realization%field
+
+  th_parameter => patch%aux%TH%th_parameter
+  th_auxvars => patch%aux%TH%auxvars
+  th_auxvars_bc => patch%aux%TH%auxvars_bc
+  global_auxvars => patch%aux%Global%auxvars
+  global_auxvars_bc => patch%aux%Global%auxvars_bc
+  material_auxvars => patch%aux%Material%auxvars
+
+
+  call VecGetArray(field%flow_xx_loc,xx_loc_p,ierr);CHKERRQ(ierr)
+
+  ! Boundary Flux Terms -----------------------------------
+  boundary_condition => patch%boundary_condition_list%first
+  sum_connection = 0
+  do
+    if (.not.associated(boundary_condition)) exit
+
+    cur_connection_set => boundary_condition%connection_set
+
+    do iconn = 1, cur_connection_set%num_connections
+      sum_connection = sum_connection + 1
+
+      local_id = cur_connection_set%id_dn(iconn)
+      ghosted_id = grid%nL2G(local_id)
+
+      if (patch%imat(ghosted_id) <= 0) cycle
+
+      if (ghosted_id<=0) then
+        print *, "Wrong boundary node index... STOP!!!"
+        stop
+      endif
+
+      icct_dn   = patch%cct_id(ghosted_id)
+      D_dn      = th_parameter%ckwet(icct_dn)
+      Dk_dry_dn = th_parameter%ckdry(icct_dn)
+      alpha_dn  = th_parameter%alpha(icct_dn)
+
+      icc_dn = patch%cc_id(ghosted_id)
+
+      if (option%flow%th_freezing) then
+         DK_ice_dn = th_parameter%ckfrozen(icct_dn)
+         alpha_fr_dn = th_parameter%alpha_fr(icct_dn)
+
+         sf_dn => patch%saturation_function_array(icc_dn)%ptr
+      else
+         Dk_ice_dn = Dk_dry_dn
+         alpha_fr_dn = alpha_dn
+
+         cc_dn => patch%characteristic_curves_array(icc_dn)%ptr
+      endif
+
+      tcc_dn => patch%char_curves_thermal_array(icct_dn)%ptr
+
+      call THBCFluxDerivative(boundary_condition%flow_condition%itype, &
+                              boundary_condition%flow_aux_real_var(:,iconn), &
+                              th_auxvars_bc(sum_connection), &
+                              global_auxvars_bc(sum_connection), &
+                              th_auxvars(ghosted_id), &
+                              global_auxvars(ghosted_id), &
+                              material_auxvars(ghosted_id), &
+                              D_dn, &
+                              cur_connection_set%area(iconn), &
+                              cur_connection_set%dist(-1:3,iconn), &
+                              th_parameter%sir(1,icc_dn), &
+                              option, &
+                              sf_dn,cc_dn, tcc_dn, &
+                              Dk_dry_dn,Dk_ice_dn, &
+                              Jdn)
+      Jdn = -Jdn
+
+      if (th_scale_by_volume)then
+        Jdn = Jdn/material_auxvars(ghosted_id)%volume
+      endif
+      call PUMSetValuesBlockedLocal(A,1,ghosted_id-1,1,ghosted_id-1,Jdn, &
+                                    ADD_VALUES,ierr);CHKERRQ(ierr)
+
+    enddo
+    boundary_condition => boundary_condition%next
+  enddo
+
+  if (debug%matview_Matrix_detailed) then
+    call MatAssemblyBegin(A,MAT_FINAL_ASSEMBLY,ierr);CHKERRQ(ierr)
+    call MatAssemblyEnd(A,MAT_FINAL_ASSEMBLY,ierr);CHKERRQ(ierr)
+    call DebugMatView(debug,A,'jacobian_bcflux.out',option)
+  endif
+
+  call VecRestoreArray(field%flow_xx_loc,xx_loc_p,ierr);CHKERRQ(ierr)
+
+end subroutine THJacobianBoundaryConn
+
+! ************************************************************************** !
+
+subroutine THJacobianAccumulation(A,realization,debug,ierr)
+  !
+  ! Computes the jacobian contribution from accumulation term
+  !
+  ! Author: ??
+  ! Date: 12/13/07
+  ! Refactored by Satish Karra, LANL 06/12/2019
+  !
+
+
+  use Connection_module
+  use Option_module
+  use Grid_module
+  use Realization_Subsurface_class
+  use Patch_module
+  use Coupler_module
+  use Field_module
+  use Debug_module
+  use Secondary_Continuum_Aux_module
+  use Secondary_Continuum_module
+  use Saturation_Function_module
+  use Characteristic_Curves_module
+  use Characteristic_Curves_Thermal_module
+  use Petsc_Utility_module
+
+  Mat :: A
+  class(realization_subsurface_type) :: realization
+  type(debug_type) :: debug
+
+  PetscErrorCode :: ierr
+
+  PetscReal, pointer :: xx_loc_p(:)
+  PetscInt :: local_id, ghosted_id
+
+  PetscReal :: Jup(realization%option%nflowdof,realization%option%nflowdof)
+
+  PetscInt :: istart, iend
+  PetscInt :: icc
+  type(grid_type), pointer :: grid
+  type(patch_type), pointer :: patch
+  type(option_type), pointer :: option
+  type(field_type), pointer :: field
+  type(th_parameter_type), pointer :: th_parameter
+  type(th_auxvar_type), pointer :: th_auxvars(:)
+  type(global_auxvar_type), pointer :: global_auxvars(:)
+  type(material_auxvar_type), pointer :: material_auxvars(:)
+
+  type(saturation_function_type), pointer :: sat_func
+  class(characteristic_curves_type), pointer :: characteristic_curves
+  class(cc_thermal_type), pointer :: thermal_cc
+
+  type(sec_heat_type), pointer :: sec_heat_vars(:)
+  PetscInt :: icct
+
+  PetscReal :: vol_frac_prim
+
+  ! secondary continuum variables
+  PetscReal :: jac_sec_heat
+
+  nullify(sat_func)
+  nullify(characteristic_curves)
+
+  patch => realization%patch
+  grid => patch%grid
+  option => realization%option
+  field => realization%field
+
+  th_parameter => patch%aux%TH%th_parameter
+  th_auxvars => patch%aux%TH%auxvars
+  global_auxvars => patch%aux%Global%auxvars
+  material_auxvars => patch%aux%Material%auxvars
+
+  sec_heat_vars => patch%aux%SC_heat%sec_heat_vars
+
+  call VecGetArray(field%flow_xx_loc,xx_loc_p,ierr);CHKERRQ(ierr)
+
+  vol_frac_prim = 1.d0
+
+  ! Accumulation terms ------------------------------------
+  do local_id = 1, grid%nlmax  ! For each local node do...
+    ghosted_id = grid%nL2G(local_id)
+    ! Ignore inactive cells with inactive materials
+    if (patch%imat(ghosted_id) <= 0) cycle
+    iend = local_id*option%nflowdof
+    istart = iend-option%nflowdof+1
+    icc = patch%cc_id(ghosted_id)
+
+    if (option%use_sc) then
+      vol_frac_prim = material_auxvars(ghosted_id)%secondary_prop%epsilon
+    endif
+
+    icct = patch%cct_id(ghosted_id)
+
+    if (option%flow%th_freezing) then
+      sat_func => patch%saturation_function_array(icc)%ptr
+    else
+      characteristic_curves => patch%characteristic_curves_array(icc)%ptr
+    endif
+
+    thermal_cc => patch%char_curves_thermal_array(icct)%ptr
+
+    call THAccumDerivative(th_auxvars(ghosted_id),global_auxvars(ghosted_id), &
+                            material_auxvars(ghosted_id), &
+                            th_parameter, &
+                            th_parameter%dencpr(icct), &
+                            icct, option, &
+                            sat_func, characteristic_curves, &
+                            thermal_cc, &
+                            vol_frac_prim,Jup)
+
+    if (option%use_sc) then
+      if (.not.Equal((material_auxvars(ghosted_id)% &
+          secondary_prop%epsilon),1.d0)) then
+        call SecondaryHeatJacobian(sec_heat_vars(local_id), &
+                                   th_parameter%ckwet(icct), &
+                                   th_parameter%dencpr(icct), &
+                                   option,jac_sec_heat)
+
+        Jup(TH_ENERGY_EQUATION_INDEX,TH_TEMPERATURE_DOF) = &
+          Jup(TH_ENERGY_EQUATION_INDEX,TH_TEMPERATURE_DOF) - &
+                                 jac_sec_heat*material_auxvars(ghosted_id)%volume
+      endif
+    endif
+
+    if (th_scale_by_volume)then
+      Jup = Jup/material_auxvars(ghosted_id)%volume
+    endif
+    call PUMSetValuesBlockedLocal(A,1,ghosted_id-1,1,ghosted_id-1,Jup, &
+                                  ADD_VALUES,ierr);CHKERRQ(ierr)
+  enddo
+
+
+  if (debug%matview_Matrix_detailed) then
+    call MatAssemblyBegin(A,MAT_FINAL_ASSEMBLY,ierr);CHKERRQ(ierr)
+    call MatAssemblyEnd(A,MAT_FINAL_ASSEMBLY,ierr);CHKERRQ(ierr)
+    call DebugMatView(debug,A,'jacobian_accum.out',option)
+  endif
+
+
+  call VecRestoreArray(field%flow_xx_loc,xx_loc_p,ierr);CHKERRQ(ierr)
+
+end subroutine THJacobianAccumulation
+
+! ************************************************************************** !
+
+subroutine THJacobianSourceSink(A,realization,debug,ierr)
+  !
+  ! Computes the jacobian contribution from source sink
+  !
+  ! Author: ??
+  ! Date: 12/13/07
+  ! Refactored by Satish Karra, LANL 06/12/2019
+  !
+
+
+  use Connection_module
+  use Option_module
+  use Grid_module
+  use Realization_Subsurface_class
+  use Patch_module
+  use Coupler_module
+  use Field_module
+  use Debug_module
+  use Secondary_Continuum_Aux_module
+  use Utility_module, only : Smoothstep
+  use Petsc_Utility_module
+
+  Mat :: A
+  class(realization_subsurface_type) :: realization
+  type(debug_type) :: debug
+
+  PetscErrorCode :: ierr
+
+  PetscReal, pointer :: xx_loc_p(:)
+  PetscInt :: local_id, ghosted_id
+  PetscReal :: Jsrc(realization%option%nflowdof,realization%option%nflowdof)
+  PetscReal :: Rdummy(realization%option%nflowdof)
+
+  type(coupler_type), pointer :: source_sink
+  type(connection_set_type), pointer :: cur_connection_set
+  PetscInt :: iconn
+  PetscInt :: sum_connection
+  type(grid_type), pointer :: grid
+  type(patch_type), pointer :: patch
+  type(option_type), pointer :: option
+  type(field_type), pointer :: field
+  type(th_parameter_type), pointer :: th_parameter
+  type(th_auxvar_type), pointer :: th_auxvars(:), th_auxvars_ss(:)
+  type(global_auxvar_type), pointer :: global_auxvars(:)
+  type(material_auxvar_type), pointer :: material_auxvars(:)
+
+  PetscReal :: dummy_real
+  PetscReal, pointer :: flow_array(:)
+  PetscReal, pointer :: energy_array(:)
+
+  patch => realization%patch
+  grid => patch%grid
+  option => realization%option
+  field => realization%field
+
+  th_parameter => patch%aux%TH%th_parameter
+  th_auxvars => patch%aux%TH%auxvars
+  th_auxvars_ss => patch%aux%TH%auxvars_ss
+  global_auxvars => patch%aux%Global%auxvars
+  material_auxvars => patch%aux%Material%auxvars
+
+  call VecGetArray(field%flow_xx_loc,xx_loc_p,ierr);CHKERRQ(ierr)
+
+  ! Source/sink terms -------------------------------------
+  source_sink => patch%source_sink_list%first
+  sum_connection = 0
+  do
+    if (.not.associated(source_sink)) exit
+
+    cur_connection_set => source_sink%connection_set
+
+    flow_array => source_sink%flow_condition%rate%dataset%rarray
+    nullify(energy_array)
+    if (associated(source_sink%flow_condition%energy_rate)) then
+      energy_array => source_sink%flow_condition%energy_rate%dataset%rarray
+    endif
+
+    do iconn = 1, cur_connection_set%num_connections
+
+      sum_connection = sum_connection + 1
+      local_id = cur_connection_set%id_dn(iconn)
+      ghosted_id = grid%nL2G(local_id)
+
+      if (patch%imat(ghosted_id) <= 0) cycle
+
+      call THSourceSink(source_sink%flow_condition%itype, &
+                        source_sink%flow_condition%rate%itype, &
+                        flow_array,energy_array, &
+                        th_auxvars(ghosted_id),th_auxvars_ss(iconn), &
+                        material_auxvars(ghosted_id), &
+                        source_sink%flow_aux_real_var(:,iconn), &
+                        source_sink%flow_condition%rate%aux_real(:), &
+                        Rdummy,Jsrc, &
+                        dummy_real, &
+                        PETSC_TRUE,option)
+      call PUMSetValuesBlockedLocal(A,1,ghosted_id-1,1,ghosted_id-1,Jsrc, &
+                                    ADD_VALUES,ierr);CHKERRQ(ierr)
+
+    enddo
+    source_sink => source_sink%next
+  enddo
+
+  if (debug%matview_Matrix_detailed) then
+    call MatAssemblyBegin(A,MAT_FINAL_ASSEMBLY,ierr);CHKERRQ(ierr)
+    call MatAssemblyEnd(A,MAT_FINAL_ASSEMBLY,ierr);CHKERRQ(ierr)
+    call DebugMatView(debug,A,'jacobian_srcsink.out',option)
+  endif
+
+  call VecRestoreArray(field%flow_xx_loc,xx_loc_p,ierr);CHKERRQ(ierr)
+
+end subroutine THJacobianSourceSink
+
+! ************************************************************************** !
+
+subroutine THSourceSink(itype,iratetype,flow_array,energy_array, &
+                        th_auxvar,th_auxvar_ss,material_auxvar, &
+                        flow_aux_real_var,rate_aux_real, &
+                        Res,J,qsrc_kmol,calculate_derivatives,option)
+  !
+  ! Computes the jacobian contribution from source sink
+  !
+  ! Author: Glenn Hammond
+  ! Date: 08/08/25
+
+  use Option_module
+  use String_module
+  use Utility_module, only : Smoothstep
+
+  type(option_type) :: option
+  PetscInt :: itype(:)
+  PetscInt :: iratetype
+  PetscReal :: flow_array(:)
+  PetscReal :: energy_array(:)
+  type(th_auxvar_type) :: th_auxvar
+  type(th_auxvar_type) :: th_auxvar_ss
+  type(material_auxvar_type) :: material_auxvar
+  PetscReal :: flow_aux_real_var(:)
+  PetscReal :: rate_aux_real(:)
+  PetscReal :: Res(option%nflowdof)
+  PetscReal :: J(option%nflowdof,option%nflowdof)
+  PetscReal :: qsrc_kmol
+  PetscBool :: calculate_derivatives
+
+  PetscReal :: qsrc0
+  PetscReal :: esrc
+  PetscReal :: threshold_pressure
+  PetscReal :: pressure_span
+  PetscBool :: inhibit_flow_above_pressure
+  PetscReal :: max_pressure
+  PetscReal :: min_pressure
+  PetscReal :: smoothstep_scale
+  PetscReal :: dsmoothstep_dp
+  PetscReal :: dqsrc_kmol_dsmoothstep
+  PetscReal :: volume_scale
+
+  PetscReal :: well_status
+  PetscReal :: well_factor
+  PetscReal :: pressure_bh
+  PetscReal :: pressure_max
+  PetscReal :: pressure_min
+  PetscReal :: Dq, dphi, ukvr, v_darcy
+  PetscReal :: dqsrc_dp
+
+  qsrc_kmol = 0.d0
+  qsrc0 = flow_array(1)
+  smoothstep_scale = 1.d0
+  dsmoothstep_dp = 0.d0
+  dqsrc_kmol_dsmoothstep = 0.d0
+
+  select case (iratetype)
+    case(MASS_RATE_SS)
+      qsrc_kmol = qsrc0 / FMWH2O ! [kg/s -> kmol/s; fmw -> g/mol = kg/kmol]
+    case(SCALED_MASS_RATE_SS)
+      qsrc_kmol = qsrc0 / FMWH2O * &
+            ! [kg/s -> kmol/s; fmw -> g/mol = kg/kmol]
+        flow_aux_real_var(ONE_INTEGER)
+    case(VOLUMETRIC_RATE_SS)  ! assume local density for now
+      ! qsrc = m^3/sec
+      qsrc_kmol = qsrc0*th_auxvar%den ! den = kmol/m^3
+    case(SCALED_VOLUMETRIC_RATE_SS)  ! assume local density for now
+      ! qsrc = m^3/sec
+      qsrc_kmol = qsrc0*th_auxvar%den* & ! den = kmol/m^3
+                  flow_aux_real_var(ONE_INTEGER)
+    case(HET_MASS_RATE_SS)
+      qsrc_kmol = flow_aux_real_var(ONE_INTEGER)/FMWH2O
+    case(PRES_REG_MASS_RATE_SS)
+      threshold_pressure = rate_aux_real(1)
+      inhibit_flow_above_pressure = (threshold_pressure > 0)
+      threshold_pressure = dabs(threshold_pressure)
+      pressure_span = rate_aux_real(2)
+      if (inhibit_flow_above_pressure) then
+        min_pressure = threshold_pressure-pressure_span
+        max_pressure = threshold_pressure
+      else
+        min_pressure = threshold_pressure
+        max_pressure = threshold_pressure+pressure_span
+      endif
+      volume_scale = flow_aux_real_var(ONE_INTEGER)
+      call Smoothstep(th_auxvar%pres, &
+                      min_pressure,max_pressure, &
+                      smoothstep_scale,dsmoothstep_dp)
+      if (inhibit_flow_above_pressure) then
+        smoothstep_scale = 1.d0-smoothstep_scale
+        dsmoothstep_dp = -1.d0 * dsmoothstep_dp
+      endif
+      dqsrc_kmol_dsmoothstep = qsrc0/FMWH2O*volume_scale
+      qsrc_kmol = dqsrc_kmol_dsmoothstep*smoothstep_scale
+    case(WELL_SS) ! production well, Karra 11/10/2015
+      ! if node pessure is lower than the given extraction pressure,
+      ! shut it down
+      !  well parameter explanation
+      !   1. well status. 1 injection; -1 production; 0 shut in!
+      !   2. well factor [m^3],  the effective permeability [m^2/s]
+      !   3. bottomhole pressure:  [Pa]
+      !   4. max pressure: [Pa]
+      !   5. min pressure: [Pa]
+      well_status = energy_array(1)
+      well_factor = energy_array(2)
+      pressure_bh = energy_array(3)
+      pressure_max = energy_array(4)
+      pressure_min = energy_array(5)
+
+      ! production well (well status = -1)
+      if (dabs(well_status + 1.d0) < 1.d-1) then
+        if (th_auxvar%pres > pressure_min) then
+          Dq = well_factor
+          dphi = th_auxvar%pres - pressure_bh
+          if (dphi >= 0.d0) then ! outflow only
+            ukvr = th_auxvar%mobility
+            if (ukvr < 1.d-20) ukvr = 0.d0
+            v_darcy = 0.d0
+            if (ukvr*Dq > floweps) then
+              v_darcy = Dq * ukvr * dphi
+              ! store volumetric rate for ss_fluid_fluxes()
+              qsrc_kmol = -1.d0*v_darcy*th_auxvar%den
+            endif
+          endif
+        endif
+      endif
+
+    case default
+      call PrintErrMsg(option,'TH mode source/sink '//StringWrite(itype)// &
+                       ' not implemented.')
+  end select
+
+  Res(TH_PRESSURE_DOF) = qsrc_kmol
+
+  esrc = 0.d0
+  ! the unit of *_RATE_SS are J/s
+  select case(itype(2))
+    case (ENERGY_RATE_SS)
+      esrc = energy_array(1)
+    case (SCALED_ENERGY_RATE_SS)
+      esrc = energy_array(1) * flow_aux_real_var(ONE_INTEGER)
+    case (HET_ENERGY_RATE_SS)
+      esrc = flow_aux_real_var(TWO_INTEGER)
+  end select
+  ! convert J/s --> MJ/s
+  !geh: default internal energy units are MJ (option%scale = 1.d-6 is for
+  !     J->MJ)
+  Res(TH_TEMPERATURE_DOF) = esrc*1.d6*option%scale
+
+  ! Update residual term associated with T
+  if (qsrc_kmol > 0.d0) then ! injection
+    Res(TH_TEMPERATURE_DOF) = Res(TH_TEMPERATURE_DOF) + &
+      qsrc_kmol*th_auxvar_ss%h
+  else
+    ! extraction
+    Res(TH_TEMPERATURE_DOF) = Res(TH_TEMPERATURE_DOF) + &
+      qsrc_kmol*th_auxvar%h
+  endif
+
+!  if (.not.calculate_derivatives) then
+!    print *, Res
+!  endif
+  if (calculate_derivatives) then
+
+    J = 0.d0
+
+    dqsrc_dp = dqsrc_kmol_dsmoothstep*dsmoothstep_dp
+    if (qsrc_kmol > 0.d0) then ! injection
+      J(TH_PRESSURE_DOF,TH_PRESSURE_DOF) = -dqsrc_dp
+      J(TH_TEMPERATURE_DOF,TH_PRESSURE_DOF) = &
+        -qsrc_kmol*th_auxvar_ss%dh_dp - &
+        th_auxvar_ss%h*dqsrc_dp
+      ! since tsrc1 is prescribed, there is no derivative
+      ! dresT_dT = -qsrc1*hw_dT
+    else
+      ! extraction
+      J(TH_PRESSURE_DOF,TH_PRESSURE_DOF) = -dqsrc_dp
+      J(TH_TEMPERATURE_DOF,TH_PRESSURE_DOF) = &
+        -qsrc_kmol*th_auxvar%dh_dp - &
+        th_auxvar%h*dqsrc_dp
+      J(TH_TEMPERATURE_DOF,TH_TEMPERATURE_DOF) = &
+        -qsrc_kmol*th_auxvar%dh_dT
+    endif
+
+    if (th_scale_by_volume) then
+      J = J/material_auxvar%volume
+    endif
+
+  endif
+
+end subroutine THSourceSink
+
+! ************************************************************************** !
+
+subroutine THMaxChange(realization,dpmax,dtmpmax)
+  !
+  ! Computes the maximum change in the solution vector
+  !
+  ! Author: ???
+  ! Date: 01/15/08
+  !
+
+  use Realization_Subsurface_class
+  use Option_module
+  use Field_module
+
+  implicit none
+
+  class(realization_subsurface_type) :: realization
+
+  type(option_type), pointer :: option
+  type(field_type), pointer :: field
+
+  PetscReal :: dpmax, dtmpmax
+  PetscErrorCode :: ierr
+
+  option => realization%option
+  field => realization%field
+
+  dpmax = 0.d0
+  dtmpmax = 0.d0
+
+  call VecWAXPY(field%flow_dxx,-1.d0,field%flow_xx,field%flow_yy, &
+                ierr);CHKERRQ(ierr)
+  call VecStrideNorm(field%flow_dxx,ZERO_INTEGER,NORM_INFINITY,dpmax, &
+                     ierr);CHKERRQ(ierr)
+  call VecStrideNorm(field%flow_dxx,ONE_INTEGER,NORM_INFINITY,dtmpmax, &
+                     ierr);CHKERRQ(ierr)
+
+end subroutine THMaxChange
+
+! ************************************************************************** !
+
+subroutine THResidualToMass(realization)
+  !
+  ! Computes mass balance from residual equation
+  !
+  ! Author: ???
+  ! Date: 12/10/07
+  !
+
+  use Realization_Subsurface_class
+  use Patch_module
+  use Discretization_module
+  use Field_module
+  use Option_module
+  use Grid_module
+
+  implicit none
+
+  class(realization_subsurface_type) :: realization
+
+  type(field_type), pointer :: field
+  type(patch_type), pointer :: patch
+  type(grid_type), pointer :: grid
+  type(option_type), pointer :: option
+
+  PetscReal, pointer :: mass_balance_p(:)
+  type(th_auxvar_type), pointer :: th_auxvars(:)
+  type(global_auxvar_type), pointer :: global_auxvars(:)
+  PetscErrorCode :: ierr
+  PetscInt :: local_id, ghosted_id
+  PetscInt :: istart
+
+  option => realization%option
+  field => realization%field
+  patch => realization%patch
+  grid => patch%grid
+
+  th_auxvars => patch%aux%TH%auxvars
+  global_auxvars => patch%aux%Global%auxvars
+  call VecGetArray(field%flow_ts_mass_balance,mass_balance_p, &
+                      ierr);CHKERRQ(ierr)
+
+  do local_id = 1, grid%nlmax
+    ghosted_id = grid%nL2G(local_id)
+    if (patch%imat(ghosted_id) <= 0) cycle
+
+    istart = (ghosted_id-1)*option%nflowdof+1
+    mass_balance_p(istart) = mass_balance_p(istart)/ &
+                              th_auxvars(ghosted_id)%den* &
+                              th_auxvars(ghosted_id)%den_kg
+  enddo
+
+  call VecRestoreArray(field%flow_ts_mass_balance,mass_balance_p, &
+                          ierr);CHKERRQ(ierr)
+
+end subroutine THResidualToMass
+
+! ************************************************************************** !
+
+function THGetTecplotHeader(realization,icolumn)
+  !
+  ! THLiteGetTecplotHeader: Returns TH contribution to
+  ! Tecplot file header
+  !
+  ! Author: ???
+  ! Date: 02/13/08
+  !
+
+  use Realization_Subsurface_class
+  use Option_module
+  use Field_module
+
+  implicit none
+
+  character(len=MAXSTRINGLENGTH) :: THGetTecplotHeader
+  class(realization_subsurface_type) :: realization
+  PetscInt :: icolumn
+
+  character(len=MAXSTRINGLENGTH) :: string, string2
+  type(option_type), pointer :: option
+  type(field_type), pointer :: field
+  PetscInt :: i
+
+  option => realization%option
+  field => realization%field
+
+  string = ''
+
+  if (icolumn > -1) then
+    icolumn = icolumn + 1
+    write(string2,'('',"'',i2,''-T [C]"'')') icolumn
+  else
+    write(string2,'('',"T [C]"'')')
+  endif
+  string = trim(string) // trim(string2)
+
+  if (icolumn > -1) then
+    icolumn = icolumn + 1
+    write(string2,'('',"'',i2,''-P [Pa]"'')') icolumn
+  else
+    write(string2,'('',"P [Pa]"'')')
+  endif
+  string = trim(string) // trim(string2)
+
+  if (icolumn > -1) then
+    icolumn = icolumn + 1
+    write(string2,'('',"'',i2,''-Sl"'')') icolumn
+  else
+    write(string2,'('',"Sl"'')')
+  endif
+  string = trim(string) // trim(string2)
+
+  if (option%flow%th_freezing) then
+     if (icolumn > -1) then
+        icolumn = icolumn + 1
+        write(string2,'('',"'',i2,''-Sg"'')') icolumn
+     else
+        write(string2,'('',"Sg"'')')
+     endif
+     string = trim(string) // trim(string2)
+
+     if (icolumn > -1) then
+        icolumn = icolumn + 1
+        write(string2,'('',"'',i2,''-Si"'')') icolumn
+     else
+        write(string2,'('',"Si"'')')
+     endif
+     string = trim(string) // trim(string2)
+
+     if (icolumn > -1) then
+        icolumn = icolumn + 1
+        write(string2,'('',"'',i2,''-deni"'')') icolumn
+     else
+        write(string2,'('',"deni"'')')
+     endif
+     string = trim(string) // trim(string2)
+  endif
+
+  if (icolumn > -1) then
+    icolumn = icolumn + 1
+    write(string2,'('',"'',i2,''-denl"'')') icolumn
+  else
+    write(string2,'('',"denl"'')')
+  endif
+  string = trim(string) // trim(string2)
+
+  if (icolumn > -1) then
+    icolumn = icolumn + 1
+    write(string2,'('',"'',i2,''-Ul"'')') icolumn
+  else
+    write(string2,'('',"Ul"'')')
+  endif
+  string = trim(string) // trim(string2)
+
+  if (icolumn > -1) then
+    icolumn = icolumn + 1
+    write(string2,'('',"'',i2,''-visl"'')') icolumn
+  else
+    write(string2,'('',"visl"'')')
+  endif
+  string = trim(string) // trim(string2)
+
+  if (icolumn > -1) then
+    icolumn = icolumn + 1
+    write(string2,'('',"'',i2,''-mobilityl"'')') icolumn
+  else
+    write(string2,'('',"mobilityl"'')')
+  endif
+  string = trim(string) // trim(string2)
+
+  do i=1,option%nflowspec
+    if (icolumn > -1) then
+      icolumn = icolumn + 1
+      write(string2,'('',"'',i2,''-Xl('',i2,'')"'')') icolumn,i
+    else
+      write(string2,'('',"Xl('',i2,'')"'')') i
+    endif
+    string = trim(string) // trim(string2)
+  enddo
+
+  THGetTecplotHeader = string
+
+end function THGetTecplotHeader
+
+! ************************************************************************** !
+
+subroutine THSetPlotVariables(realization,list)
+  !
+  ! Adds variables to be printed to list
+  !
+  ! Author: Glenn Hammond
+  ! Date: 10/15/12
+  !
+
+  use Realization_Subsurface_class
+  use Output_Aux_module
+  use Variables_module
+  use Material_Aux_module
+  use Option_module
+
+  implicit none
+
+  class(realization_subsurface_type) :: realization
+  type(output_variable_list_type), pointer :: list
+
+  character(len=MAXWORDLENGTH) :: name, units
+  type(option_type), pointer :: option
+
+  option => realization%option
+
+  if (associated(list%first)) then
+    return
+  endif
+
+  if (list%flow_vars) then
+
+    name = 'Liquid Pressure'
+    units = 'Pa'
+    call OutputVariableAddToList(list,name,OUTPUT_PRESSURE,units, &
+                                LIQUID_PRESSURE)
+
+    name = 'Liquid Saturation'
+    units = ''
+    call OutputVariableAddToList(list,name,OUTPUT_SATURATION,units, &
+                                LIQUID_SATURATION)
+
+    name = 'Liquid Density'
+    units = 'kg/m^3'
+    call OutputVariableAddToList(list,name,OUTPUT_GENERIC,units, &
+                                LIQUID_DENSITY)
+
+    name = 'Liquid Energy'
+    units = 'kJ/mol'
+    call OutputVariableAddToList(list,name,OUTPUT_GENERIC,units, &
+                                LIQUID_ENERGY)
+
+    name = 'Liquid Viscosity'
+    units = 'Pa.s'
+    call OutputVariableAddToList(list,name,OUTPUT_GENERIC,units, &
+                                LIQUID_VISCOSITY)
+
+    name = 'Liquid Mobility'
+    units = '1/Pa.s'
+    call OutputVariableAddToList(list,name,OUTPUT_GENERIC,units, &
+                                LIQUID_MOBILITY)
+
+  endif
+
+  if (list%energy_vars) then
+
+    name = 'Temperature'
+    units = 'C'
+    call OutputVariableAddToList(list,name,OUTPUT_GENERIC,units, &
+                                TEMPERATURE)
+
+    if (Initialized(th_well_dof)) then
+      name = 'Pipe Temperature'
+      units = 'C'
+      call OutputVariableAddToList(list,name,OUTPUT_GENERIC,units, &
+                                   WELL_TEMPERATURE)
+      name = 'Pipe Cells'
+      units = ''
+      call OutputVariableAddToList(list,name,OUTPUT_GENERIC,units, &
+                                   WELL_CELLS)
+    endif
+
+  endif
+
+  if (option%flow%th_freezing) then
+
+    if (th_ice_model /= DALL_AMICO) then
+      name = 'Gas Saturation'
+      units = ''
+      call OutputVariableAddToList(list,name,OUTPUT_SATURATION,units, &
+          GAS_SATURATION)
+    endif
+
+    name = 'Ice Saturation'
+    units = ''
+    call OutputVariableAddToList(list,name,OUTPUT_SATURATION,units, &
+        ICE_SATURATION)
+
+    name = 'Ice Density'
+    units = 'kg/m^3'
+    call OutputVariableAddToList(list,name,OUTPUT_SATURATION,units, &
+        ICE_DENSITY)
+
+  endif
+
+  if (soil_compressibility_index > 0) then
+
+    name = 'Porosity'
+    units = ''
+    call OutputVariableAddToList(list,name,OUTPUT_GENERIC,units, &
+                                 POROSITY)
+
+  endif
+! name = 'Phase'
+! units = ''
+! output_variable%iformat = 1 ! integer
+! call OutputVariableAddToList(list,name,OUTPUT_GENERIC,units, &
+!                              PHASE)
+
+end subroutine THSetPlotVariables
+
+! ************************************************************************** !
+
+function THInitGuessCheck(xx, option)
+  !
+  ! Checks if the initial guess is valid.
+  ! Note: Only implemented for DALL_AMICO formulation.
+  !
+  ! Author: Gautam Bisht, LBNL
+  ! Date: 12/04/2014
+  !
+  use Option_module
+
+  Vec :: xx
+  type(option_type), pointer :: option
+
+  PetscInt :: THInitGuessCheck
+  PetscInt :: idx
+  PetscReal :: pres_min, pres_max
+  PetscReal :: temp_min, temp_max
+  PetscInt :: ipass, ipass0
+  PetscErrorCode :: ierr
+
+  ipass = 1
+
+  if (th_ice_model /= DALL_AMICO) then
+    THInitGuessCheck = ipass
+    return
+  endif
+
+  call VecStrideMin(xx,ZERO_INTEGER,idx,pres_min,ierr);CHKERRQ(ierr)
+  call VecStrideMin(xx,ONE_INTEGER,idx,temp_min,ierr);CHKERRQ(ierr)
+  call VecStrideMax(xx,ZERO_INTEGER,idx,pres_max,ierr);CHKERRQ(ierr)
+  call VecStrideMax(xx,ONE_INTEGER,idx,temp_max,ierr);CHKERRQ(ierr)
+
+  if (pres_min < -1.d10 .or. pres_min > 1.d10 .or. &
+      temp_min < -100.d0 .or. temp_max > 100.d0) then
+      ipass = -1
+  endif
+
+   call MPI_Barrier(option%mycomm,ierr);CHKERRQ(ierr)
+   if (option%comm%size>1)then
+      call MPI_Allreduce(ipass,ipass0,ONE_INTEGER_MPI,MPIU_INTEGER,MPI_SUM, &
+                         option%mycomm,ierr);CHKERRQ(ierr)
+      if (ipass0 < option%comm%size) ipass=-1
+   endif
+   THInitGuessCheck = ipass
+
+end function THInitGuessCheck
+
+! ************************************************************************** !
+
+subroutine EnergyToTemperatureBisection(T,TL,TR,h,energy,Cwi,Pr,option)
+  !
+  ! Solves the following nonlinear equation using the bisection method
+  !
+  ! R(T) = rho(T) Cwi hw T - energy = 0
+  !
+  ! Author: Nathan Collier, ORNL
+  ! Date: 11/2014
+  !
+  use EOS_Water_module
+  use Option_module
+
+  implicit none
+
+  PetscReal :: T,TL,TR,h,energy,Cwi,Pr
+  type(option_type), pointer :: option
+
+  PetscReal :: Tp,rho,rho_t,f,fR,fL,rtol
+  PetscInt :: iter,niter
+  PetscBool :: found
+  PetscErrorCode :: ierr
+
+  call EOSWaterDensity(TR,Pr,rho,rho_T,ierr)
+  fR = rho*Cwi*h*(TR+T273K) - energy
+  call EOSWaterDensity(TL,Pr,rho,rho_T,ierr)
+  fL = rho*Cwi*h*(TL+T273K) - energy
+
+  if (fL*fR > 0.d0) then
+     print *,"[TL,TR] = ",TL,TR
+     print *,"[fL,fR] = ",fL,fR
+     write(option%io_buffer,'("th.F90: EnergyToTemperatureBisection -->&
+                              & root is not bracketed")')
+     call PrintErrMsg(option)
+  endif
+
+  T = 0.5d0*(TL+TR)
+  call EOSWaterDensity(T,Pr,rho,rho_T,ierr)
+  f = rho*Cwi*h*(T+T273K) - energy
+
+  found = PETSC_FALSE
+  niter = 200
+  rtol  = 1.d-6
+  do iter = 1,niter
+     Tp = T
+     if (fL*f < 0.d0) then
+        TR = T
+     else
+        TL = T
+     endif
+
+     T = 0.5d0*(TL+TR)
+
+     call EOSWaterDensity(T,Pr,rho,rho_T,ierr)
+     f = rho*Cwi*h*(T+T273K) - energy
+
+     if (abs((T-Tp)/(T+T273K)) < rtol) then
+        found = PETSC_TRUE
+        exit
+     endif
+  enddo
+
+  if (found .eqv. PETSC_FALSE) then
+     print *,"[TL,T,TR] = ",TL,T,TR
+     write(option%io_buffer,'("th.F90: EnergyToTemperatureBisection -->&
+                              & root not found!")')
+     call PrintErrMsg(option)
+  endif
+
+end subroutine EnergyToTemperatureBisection
+
+! ************************************************************************** !
+
+subroutine THMapBCAuxVarsToGlobal(realization)
+  !
+  ! Maps variables in general auxvar to global equivalent.
+  !
+  ! Author: Glenn Hammond
+  ! Date: 03/09/11
+  !
+
+  use Realization_Subsurface_class
+  use Option_module
+  use Patch_module
+  use Coupler_module
+  use Connection_module
+
+  implicit none
+
+  class(realization_subsurface_type) :: realization
+
+  type(option_type), pointer :: option
+  type(patch_type), pointer :: patch
+  type(coupler_type), pointer :: boundary_condition
+  type(connection_set_type), pointer :: cur_connection_set
+  type(th_auxvar_type), pointer :: th_auxvars_bc(:)
+  type(global_auxvar_type), pointer :: global_auxvars_bc(:)
+
+  PetscInt :: sum_connection, iconn
+  PetscBool :: copy_gas_sat
+
+  option => realization%option
+  patch => realization%patch
+
+  if (option%ntrandof == 0) return ! no need to update
+
+  th_auxvars_bc => patch%aux%TH%auxvars_bc
+  global_auxvars_bc => patch%aux%Global%auxvars_bc
+
+  copy_gas_sat = option%transport%nphase > 1
+
+  boundary_condition => patch%boundary_condition_list%first
+  sum_connection = 0
+  do
+    if (.not.associated(boundary_condition)) exit
+    cur_connection_set => boundary_condition%connection_set
+    do iconn = 1, cur_connection_set%num_connections
+      sum_connection = sum_connection + 1
+      global_auxvars_bc(sum_connection)%pres(1) = &
+        th_auxvars_bc(sum_connection)%pres
+      global_auxvars_bc(sum_connection)%sat(1) = &
+        th_auxvars_bc(sum_connection)%sat
+      if (copy_gas_sat) then
+        global_auxvars_bc(sum_connection)%sat(2) = &
+          1.d0 - th_auxvars_bc(sum_connection)%sat
+      endif
+      global_auxvars_bc(sum_connection)%den_kg(1) = &
+        th_auxvars_bc(sum_connection)%den_kg
+      global_auxvars_bc(sum_connection)%den(1) = &
+        th_auxvars_bc(sum_connection)%den
+      global_auxvars_bc(sum_connection)%temp = &
+        th_auxvars_bc(sum_connection)%temp
+    enddo
+    boundary_condition => boundary_condition%next
+  enddo
+
+end subroutine THMapBCAuxVarsToGlobal
+
+! ************************************************************************** !
+
+subroutine THDestroy(patch)
+  !
+  ! Deallocates variables associated with Richard
+  !
+  ! Author: ???
+  ! Date: 02/14/08
+  !
+
+  use Patch_module
+
+  implicit none
+
+  type(patch_type) :: patch
+
+  ! need to free array in aux vars
+  call THAuxDestroy(patch%aux%TH)
+
+end subroutine THDestroy
+
+end module TH_module

@@ -1,0 +1,428 @@
+module Init_Common_module
+
+#include "petsc/finclude/petscvec.h"
+  use petscvec
+  use PFLOTRAN_Constants_module
+
+  implicit none
+
+  private
+
+  public :: &
+!            Init, &
+            InitCommonReadRegionFiles, &
+            InitCommonReadVelocityField, &
+            InitCommonVerifyAllCouplers, &
+            InitCommonAddOutputWaypoints
+
+contains
+
+! ************************************************************************** !
+
+subroutine InitCommonVerifyAllCouplers(realization)
+  !
+  ! Verifies the connectivity of a coupler
+  !
+  ! Author: Glenn Hammond
+  ! Date: 1/8/08
+  !
+
+  use Realization_Subsurface_class
+
+  implicit none
+
+  class(realization_subsurface_type) :: realization
+
+  call InitCommonVerifyCoupler(realization, &
+                               realization%patch%initial_condition_list)
+  call InitCommonVerifyCoupler(realization, &
+                               realization%patch%boundary_condition_list)
+  call InitCommonVerifyCoupler(realization, &
+                               realization%patch%source_sink_list)
+  call InitCommonVerifyCoupler(realization, &
+                               realization%patch%well_coupler_list)
+  call InitCommonVerifyCoupler(realization, &
+                               realization%patch%prescribed_condition_list)
+
+end subroutine InitCommonVerifyAllCouplers
+
+! ************************************************************************** !
+
+subroutine InitCommonVerifyCoupler(realization,coupler_list)
+  !
+  ! Verifies the connectivity of a coupler
+  !
+  ! Author: Glenn Hammond
+  ! Date: 1/8/08
+  !
+
+  use Realization_Subsurface_class
+  use Discretization_module
+  use Option_module
+  use Coupler_module
+  use Condition_module
+  use Grid_module
+  use Output_module
+  use Output_Tecplot_module, only : OutputTecplotWriteVector
+  use Patch_module
+
+  implicit none
+
+  class(realization_subsurface_type) :: realization
+  type(coupler_list_type), pointer :: coupler_list
+
+  type(option_type), pointer :: option
+  type(grid_type), pointer :: grid
+  type(patch_type), pointer :: patch
+  type(coupler_type), pointer :: coupler
+  character(len=MAXWORDLENGTH) :: word
+  character(len=MAXSTRINGLENGTH) :: filename
+  character(len=MAXSTRINGLENGTH) :: dataset_name
+  PetscInt :: iconn, icell, local_id
+  Vec :: global_vec
+  PetscReal, pointer :: vec_ptr(:)
+  PetscErrorCode :: ierr
+
+  patch => realization%patch
+  grid => patch%grid
+  option => realization%option
+
+  if (.not.associated(coupler_list)) return
+
+  call DiscretizationCreateVector(realization%discretization,ONEDOF, &
+                                  global_vec,GLOBAL,option)
+
+  coupler => coupler_list%first
+
+  do
+    if (.not.associated(coupler)) exit
+
+    call VecZeroEntries(global_vec,ierr);CHKERRQ(ierr)
+    call VecGetArray(global_vec,vec_ptr,ierr);CHKERRQ(ierr)
+    if (associated(coupler%connection_set)) then
+      do iconn = 1, coupler%connection_set%num_connections
+        local_id = coupler%connection_set%id_dn(iconn)
+!        vec_ptr(local_id) = coupler%id
+!geh: let's sum the # of connections
+         vec_ptr(local_id) = vec_ptr(local_id) + 1
+      enddo
+    else
+      if (associated(coupler%region)) then
+        do icell = 1, coupler%region%num_cells
+          local_id = coupler%region%cell_ids(icell)
+!          vec_ptr(local_id) = coupler%id
+         vec_ptr(local_id) = vec_ptr(local_id) + 1
+        enddo
+      endif
+    endif
+    call VecRestoreArray(global_vec,vec_ptr,ierr);CHKERRQ(ierr)
+    if (len_trim(coupler%flow_condition_name) > 0) then
+      dataset_name = coupler%flow_condition_name
+    else if (len_trim(coupler%tran_condition_name) > 0) then
+      dataset_name = coupler%tran_condition_name
+    endif
+    write(word,*) patch%id
+    dataset_name = trim(dataset_name) // '_' // &
+                   trim(coupler%region%name) // '_' // &
+                   trim(adjustl(word))
+    dataset_name = dataset_name(1:28)
+    filename = trim(dataset_name) // '.tec'
+    call OutputTecplotWriteVector(filename,dataset_name,realization,global_vec)
+
+    coupler => coupler%next
+  enddo
+
+  call VecDestroy(global_vec,ierr);CHKERRQ(ierr)
+
+end subroutine InitCommonVerifyCoupler
+
+! ************************************************************************** !
+
+subroutine InitCommonReadRegionFiles(patch,region_list,option)
+  !
+  ! Reads in grid cell ids stored in files
+  !
+  ! Author: Glenn Hammond
+  ! Date: 1/03/08
+  !
+
+  use Realization_Subsurface_class
+  use Region_module
+  use HDF5_module
+  use Option_module
+  use Patch_module
+
+  implicit none
+
+  type(patch_type), pointer :: patch
+  type(region_list_type), pointer :: region_list
+  type(option_type), pointer :: option
+
+  type(region_type), pointer :: region
+  PetscBool :: cell_ids_exists
+  PetscBool :: face_ids_exists
+  PetscBool :: vert_ids_exists
+
+  region => region_list%first
+  do
+    if (.not.associated(region)) exit
+    if (len_trim(region%filename) > 1) then
+      if (index(region%filename,'.h5') > 0) then
+        call HDF5QueryRegionDefinition(region, region%filename, &
+                                       option, cell_ids_exists, &
+                                       face_ids_exists, vert_ids_exists)
+        if ((.not. cell_ids_exists) .and. &
+            (.not. face_ids_exists) .and. &
+            (.not. vert_ids_exists)) then
+          option%io_buffer = '"Regions/' // trim(region%name) // &
+                ' is not defined by "Cell Ids" or "Face Ids" or "Vertex Ids".'
+          call PrintErrMsg(option)
+        end if
+        if (cell_ids_exists .or. face_ids_exists) then
+          call HDF5ReadRegionFromFile(patch%grid,region, &
+                                      region%filename,option)
+        else
+          call HDF5ReadRegionDefinedByVertex(option, &
+                                             region, region%filename)
+        end if
+      else if (index(region%filename,'.ss') > 0) then
+        region%def_type = DEFINED_BY_SIDESET_UGRID
+        region%sideset => RegionCreateSideset()
+        call RegionReadFromFile(region%sideset,region%filename, &
+                                option)
+      else if (index(region%filename,'.ex') > 0) then
+        region%def_type = DEFINED_BY_FACE_UGRID_EXP
+        call RegionReadFromFile(region%explicit_faceset,region%cell_ids, &
+                                region%filename,option)
+        if (associated(region%cell_ids)) then
+          region%num_cells = size(region%cell_ids)
+        endif
+      else
+        call RegionReadFromFile(region,option, &
+                                region%filename)
+      endif
+    endif
+    region => region%next
+  enddo
+
+end subroutine InitCommonReadRegionFiles
+
+! ************************************************************************** !
+
+subroutine InitCommonReadVelocityField(realization)
+  !
+  ! Reads fluxes in for transport with no flow.
+  !
+  ! Author: Glenn Hammond
+  ! Date: 02/05/13
+  !
+
+  use Realization_Subsurface_class
+  use Patch_module
+  use Field_module
+  use Grid_module
+  use Option_module
+  use Coupler_module
+  use Connection_module
+  use Discretization_module
+  use HDF5_module
+  use HDF5_Aux_module
+
+  implicit none
+
+  class(realization_subsurface_type) :: realization
+  character(len=MAXSTRINGLENGTH) :: filename
+
+  type(field_type), pointer :: field
+  type(patch_type), pointer :: patch
+  type(grid_type), pointer :: grid
+  type(discretization_type), pointer :: discretization
+  type(option_type), pointer :: option
+  character(len=MAXSTRINGLENGTH) :: group_name
+  character(len=MAXSTRINGLENGTH) :: dataset_name
+  PetscInt :: idir, iconn, sum_connection
+  PetscInt :: ghosted_id_up, local_id
+  PetscErrorCode :: ierr
+
+  PetscReal, pointer :: vec_loc_p(:)
+  PetscReal, pointer :: vec_p(:)
+  type(coupler_type), pointer :: boundary_condition
+  type(connection_set_list_type), pointer :: connection_set_list
+  type(connection_set_type), pointer :: cur_connection_set
+
+  field => realization%field
+  patch => realization%patch
+  grid => patch%grid
+  option => realization%option
+  discretization => realization%discretization
+
+  filename = realization%nonuniform_velocity_filename
+
+  group_name = ''
+  do idir = 1, 3
+    select case(idir)
+      case(1)
+        dataset_name = 'Internal Velocity X'
+      case(2)
+        dataset_name = 'Internal Velocity Y'
+      case(3)
+        dataset_name = 'Internal Velocity Z'
+    end select
+    if (.not.HDF5DatasetExists(filename,group_name,dataset_name,option)) then
+      option%io_buffer = 'Dataset "' // trim(group_name) // '/' // &
+        trim(dataset_name) // &
+        '" not found in HDF5 file "' // trim(filename) // '".'
+      call PrintErrMsg(option)
+    endif
+    call HDF5ReadCellIndexedRealArray(realization,field%work,filename, &
+                                      group_name,dataset_name,PETSC_FALSE)
+    call DiscretizationGlobalToLocal(discretization,field%work,field%work_loc, &
+                                     ONEDOF)
+    call VecGetArray(field%work_loc,vec_loc_p,ierr);CHKERRQ(ierr)
+    connection_set_list => grid%internal_connection_set_list
+    cur_connection_set => connection_set_list%first
+    sum_connection = 0
+    do
+      if (.not.associated(cur_connection_set)) exit
+      do iconn = 1, cur_connection_set%num_connections
+        sum_connection = sum_connection + 1
+        ghosted_id_up = cur_connection_set%id_up(iconn)
+        if (cur_connection_set%dist(idir,iconn) > 0.9d0) then
+          patch%internal_velocities(1,sum_connection) = vec_loc_p(ghosted_id_up)
+        endif
+      enddo
+      cur_connection_set => cur_connection_set%next
+    enddo
+    call VecRestoreArray(field%work_loc,vec_loc_p,ierr);CHKERRQ(ierr)
+  enddo
+
+  boundary_condition => patch%boundary_condition_list%first
+  sum_connection = 0
+  do
+    if (.not.associated(boundary_condition)) exit
+    dataset_name = boundary_condition%name
+    if (.not.HDF5DatasetExists(filename,group_name,dataset_name,option)) then
+      option%io_buffer = 'Dataset "' // trim(group_name) // '/' // &
+        trim(dataset_name) // &
+        '" not found in HDF5 file "' // trim(filename) // '".'
+      call PrintErrMsg(option)
+    endif
+    call HDF5ReadCellIndexedRealArray(realization,field%work,filename, &
+                                      group_name,dataset_name,PETSC_FALSE)
+    call VecGetArray(field%work,vec_p,ierr);CHKERRQ(ierr)
+    cur_connection_set => boundary_condition%connection_set
+    do iconn = 1, cur_connection_set%num_connections
+      sum_connection = sum_connection + 1
+      local_id = cur_connection_set%id_dn(iconn)
+      patch%boundary_velocities(1,sum_connection) = vec_p(local_id)
+    enddo
+    call VecRestoreArray(field%work,vec_p,ierr);CHKERRQ(ierr)
+    boundary_condition => boundary_condition%next
+  enddo
+
+end subroutine InitCommonReadVelocityField
+
+! ************************************************************************** !
+
+subroutine InitCommonAddOutputWaypoints(option,output_option,waypoint_list)
+  !
+  ! Adds waypoints associated with output options to waypoint list
+  !
+  ! Author: Glenn Hammond
+  ! Date: 02/04/16
+  !
+  use Option_module
+  use Output_Aux_module
+  use String_module
+  use Utility_module
+  use Waypoint_module
+
+  implicit none
+
+  type(option_type) :: option
+  type(output_option_type) :: output_option
+  type(waypoint_list_type) :: waypoint_list
+
+  type(waypoint_type), pointer :: waypoint
+  character(len=MAXWORDLENGTH) :: word
+  PetscReal :: temp_real
+  PetscReal :: final_time
+  PetscReal :: num_waypoints, warning_num_waypoints
+  PetscInt :: itype, k
+
+  PetscReal :: time_increment
+  character(len=MAXWORDLENGTH) :: type_string
+  PetscBool :: snap_flag
+  PetscBool :: obs_flag
+  PetscBool :: msbl_flag
+  PetscBool :: cons_flag
+
+
+  !geh: The repetitive summation of a time increment can result in slight
+  !     error.   The perturbation is designed to allow for a slight shift
+  !     beyond the final time.
+  final_time = WaypointListGetFinalTime(waypoint_list)
+  temp_real = final_time * 1.d-10
+  final_time = final_time + temp_real
+  warning_num_waypoints = 15000.0
+
+  do itype = 1, 4
+    snap_flag = PETSC_FALSE
+    obs_flag = PETSC_FALSE
+    msbl_flag = PETSC_FALSE
+    cons_flag = PETSC_FALSE
+    select case(itype)
+      case(1) ! snapshot
+        type_string = 'snapshot'
+        time_increment = output_option%periodic_snap_output_time_incr
+        snap_flag = PETSC_TRUE
+      case(2) ! observation
+        type_string = 'observation'
+        time_increment = output_option%periodic_obs_output_time_incr
+        obs_flag = PETSC_TRUE
+      case(3) ! mass balance
+        type_string = 'mass balance'
+        time_increment = output_option%periodic_msbl_output_time_incr
+        msbl_flag = PETSC_TRUE
+      case(4) ! conservation
+        type_string = 'conservation'
+        time_increment = output_option%periodic_cons_output_time_incr
+        cons_flag = PETSC_TRUE
+    end select
+    ! Add waypoints for periodic output
+    ! Note that the time increment is zeroed earlier if read earlier and set
+    ! using "BETWEEN X and Y"
+    if (time_increment > 0.d0) then
+      temp_real = 0.d0
+      num_waypoints = final_time / time_increment
+      if ((num_waypoints > warning_num_waypoints) .and. &
+          OptionPrintToScreen(option)) then
+        write(word,*) floor(num_waypoints)
+        write(*,*) 'WARNING: Large number (' // StringWrite(floor(num_waypoints)) // &
+          ') of periodic ' // trim(type_string) // ' output requested.'
+        write(*,'(a64)',advance='no') '         Creating periodic output &
+                                      &waypoints . . . Progress: 0%-'
+      endif
+      k = 0
+      do
+        k = k + 1
+        temp_real = temp_real + time_increment
+        if (temp_real > final_time) exit
+        waypoint => WaypointCreate()
+        waypoint%time = temp_real
+        waypoint%print_snap_output = snap_flag
+        waypoint%print_obs_output = obs_flag
+        waypoint%print_msbl_output = msbl_flag
+        waypoint%print_cons_output = cons_flag
+        call WaypointInsertInList(waypoint,waypoint_list,option)
+        if (num_waypoints > warning_num_waypoints) then
+          call UpdateProgressBar(num_waypoints,TEN_INTEGER,k, &
+                                 OptionPrintToScreen(option))
+        endif
+      enddo
+    endif
+  enddo
+
+end subroutine InitCommonAddOutputWaypoints
+
+end module Init_Common_module

@@ -1,0 +1,186 @@
+module Option_Transport_module
+
+! IMPORTANT NOTE: This module can have no dependencies on other modules!!!
+
+#include "petsc/finclude/petscsys.h"
+  use petscsys
+  use PFLOTRAN_Constants_module
+
+  implicit none
+
+  private
+
+  type, public :: transport_option_type
+
+    PetscInt :: rt_idof
+    PetscInt :: reaction_coupling
+    PetscInt :: tvd_flux_limiter
+    PetscBool :: store_fluxes
+    PetscReal :: tran_weight_t0, tran_weight_t1
+
+    PetscReal :: inf_rel_update_tol
+    PetscReal :: inf_scaled_res_tol
+
+    PetscBool :: jumpstart_kinetic_sorption
+    PetscBool :: no_checkpoint_kinetic_sorption
+    PetscBool :: no_restart_kinetic_sorption
+    PetscBool :: no_restart_mineral_vol_frac
+    PetscBool :: numerical_derivatives
+    PetscBool :: debug_derivatives
+    PetscBool :: steady_state
+    PetscBool :: use_np ! nernst-planck diffusion.
+    PetscBool :: sc_fixed_water_density
+    PetscBool :: anisotropic_tortuosity
+    PetscBool :: conservative_transport_only
+
+    PetscBool :: isothermal_transport
+    PetscBool :: isothermal_reaction
+    PetscReal :: reference_temperature
+
+    PetscBool :: force_decouple_co2
+    PetscBool :: couple_co2
+    PetscBool :: couple_co2_salinity
+
+    PetscBool :: using_newtontrdc  ! transport needs a subiteration flag
+
+    PetscInt :: nphase
+
+  end type transport_option_type
+
+  public :: OptionTransportCreate, &
+            OptionTransportInitAll, &
+            OptionTransportInitRealization, &
+            OptionTransportDestroy
+
+contains
+
+! ************************************************************************** !
+
+function OptionTransportCreate()
+  !
+  ! Allocates and initializes a new OptionTransport object
+  !
+  ! Author: Glenn Hammond
+  ! Date: 10/25/07
+  !
+
+  implicit none
+
+  type(transport_option_type), pointer :: OptionTransportCreate
+
+  type(transport_option_type), pointer :: option
+
+  allocate(option)
+
+  ! DO NOT initialize members of the option type here.  One must decide
+  ! whether the member needs initialization once for all stochastic
+  ! simulations or initialization for every realization (e.g. within multiple
+  ! stochastic simulations).  This is done in OptionTransportInitAll() and
+  ! OptionTransportInitRealization()
+  call OptionTransportInitAll(option)
+  OptionTransportCreate => option
+
+end function OptionTransportCreate
+
+! ************************************************************************** !
+
+subroutine OptionTransportInitAll(option)
+  !
+  ! Initializes all option variables
+  !
+  ! Author: Glenn Hammond
+  ! Date: 10/25/07
+  !
+
+  implicit none
+
+  type(transport_option_type) :: option
+
+  ! These variables should only be initialized once at the beginning of a
+  ! PFLOTRAN run (regardless of whether stochastic)
+
+
+  call OptionTransportInitRealization(option)
+
+end subroutine OptionTransportInitAll
+
+! ************************************************************************** !
+
+subroutine OptionTransportInitRealization(option)
+  !
+  ! Initializes option variables specific to a single
+  ! realization
+  !
+  ! Author: Glenn Hammond
+  ! Date: 10/25/07
+  !
+
+  implicit none
+
+  type(transport_option_type) :: option
+
+  ! These variables should be initialized once at the beginning of every
+  ! PFLOTRAN realization or simulation of a single realization
+
+  option%tvd_flux_limiter = 1
+  option%rt_idof = UNINITIALIZED_INTEGER
+  option%store_fluxes = PETSC_FALSE
+
+  option%reaction_coupling = GLOBAL_IMPLICIT
+  option%numerical_derivatives = PETSC_FALSE
+  option%debug_derivatives = PETSC_FALSE
+  option%conservative_transport_only = PETSC_TRUE
+  option%isothermal_transport = PETSC_TRUE
+  option%isothermal_reaction = PETSC_TRUE
+  option%reference_temperature = UNINITIALIZED_DOUBLE
+
+  option%jumpstart_kinetic_sorption = PETSC_FALSE
+  option%no_checkpoint_kinetic_sorption = PETSC_FALSE
+  option%no_restart_kinetic_sorption = PETSC_FALSE
+  option%no_restart_mineral_vol_frac = PETSC_FALSE
+  option%steady_state = PETSC_FALSE
+  option%use_np = PETSC_FALSE
+  option%sc_fixed_water_density = PETSC_FALSE
+  option%anisotropic_tortuosity = PETSC_FALSE
+
+  option%force_decouple_co2 = PETSC_FALSE
+  option%couple_co2 = PETSC_FALSE
+  option%couple_co2_salinity = PETSC_FALSE
+
+  option%using_newtontrdc = PETSC_FALSE
+
+  option%tran_weight_t0 = 0.d0
+  option%tran_weight_t1 = 0.d0
+
+  option%inf_rel_update_tol = UNINITIALIZED_DOUBLE
+  option%inf_scaled_res_tol = UNINITIALIZED_DOUBLE
+
+  option%nphase = 1
+
+end subroutine OptionTransportInitRealization
+
+! ************************************************************************** !
+
+subroutine OptionTransportDestroy(option)
+  !
+  ! Deallocates an option
+  !
+  ! Author: Glenn Hammond
+  ! Date: 10/26/07
+  !
+
+  implicit none
+
+  type(transport_option_type), pointer :: option
+
+  if (.not.associated(option)) return
+  ! all kinds of stuff needs to be added here.
+
+  ! all the below should be placed somewhere other than option.F90
+
+  deallocate(option)
+  nullify(option)
+
+end subroutine OptionTransportDestroy
+
+end module Option_Transport_module

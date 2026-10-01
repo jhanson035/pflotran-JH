@@ -1,0 +1,1059 @@
+module Reaction_Mineral_Aux_module
+
+#include "petsc/finclude/petscsys.h"
+  use petscsys
+
+  use Reaction_Database_Aux_module
+  use PFLOTRAN_Constants_module
+
+  implicit none
+
+  private
+
+  ! mineral types
+  PetscInt, parameter, public :: MINERAL_REFERENCE = 1
+  PetscInt, parameter, public :: MINERAL_KINETIC = 2
+  PetscInt, parameter, public :: MINERAL_EQUILIBRIUM = 3
+
+  PetscInt, parameter, public :: MINERAL_KINETICS_TST_SIMPLE = 1
+  PetscInt, parameter, public :: MINERAL_KINETICS_TST_COMPLEX = 2
+
+  PetscInt, parameter, public :: MINERAL_SURF_AREA_PER_BULK_VOL = 1
+  PetscInt, parameter, public :: MINERAL_SURF_AREA_PER_MNRL_MASS = 2
+  PetscInt, parameter, public :: MINERAL_SURF_AREA_PER_MNRL_VOL = 3
+
+  PetscInt, parameter, public :: MINERAL_SURF_AREA_F_NULL = 1
+  PetscInt, parameter, public :: MINERAL_SURF_AREA_F_POR_RATIO = 2
+  PetscInt, parameter, public :: MINERAL_SURF_AREA_F_VF_RATIO = 3
+  PetscInt, parameter, public :: MINERAL_SURF_AREA_F_POR_VF_RATIO = 4
+  PetscInt, parameter, public :: MINERAL_SURF_AREA_F_MNRL_MASS = 5
+  PetscInt, parameter, public :: MINERAL_SURF_AREA_F_CF_PRECIP = 6
+  PetscInt, parameter, public :: MINERAL_SURF_AREA_F_CF_PRI_DISSOL = 7
+  PetscInt, parameter, public :: MINERAL_SURF_AREA_F_CF_SEC_DISSOL = 8
+  PetscInt, parameter, public :: MINERAL_SURF_AREA_F_TARGET_REPLACEMENT_MASS = 9
+  PetscInt, parameter, public :: MINERAL_SURF_AREA_F_MNRL_MASS_CAPPED = 10
+
+  PetscInt, parameter, public :: MINERAL_NUCLEATION_CLASSICAL = 1
+  PetscInt, parameter, public :: MINERAL_NUCLEATION_SIMPLIFIED = 2
+
+  type, public :: mineral_rxn_type
+    PetscInt :: id
+    PetscInt :: itype
+    character(len=MAXWORDLENGTH) :: name
+    PetscReal :: molar_volume ! [m^3/mol]
+    PetscReal :: molar_weight ! [kg/mol]
+    PetscBool :: print_me
+    type(database_rxn_type), pointer :: dbaserxn
+    type(mass_action_override_type), pointer :: mass_action_override
+    type(transition_state_rxn_type), pointer :: tstrxn
+    type(mineral_rxn_type), pointer :: next
+  end type mineral_rxn_type
+
+  type, public :: transition_state_rxn_type
+    PetscReal :: mnrl_scale_factor
+    PetscReal :: affinity_factor_sigma
+    PetscReal :: affinity_factor_beta
+    PetscReal :: affinity_threshold
+    PetscReal :: rate_limiter
+    PetscReal :: surf_area_vol_frac_pwr
+    PetscReal :: surf_area_porosity_pwr
+    PetscBool :: surf_area_vol_frac_pwr_set
+    PetscBool :: surf_area_porosity_pwr_set
+    PetscReal :: precipitation_rate_constant
+    PetscReal :: dissolution_rate_constant
+    PetscReal :: activation_energy
+    character(len=MAXWORDLENGTH) :: armor_min_name
+    PetscReal :: armor_pwr
+    PetscReal :: armor_crit_vol_frac
+    PetscReal :: surf_area_epsilon
+    PetscReal :: vol_frac_epsilon
+    PetscInt :: surf_area_function
+    PetscReal :: spec_surf_area
+    PetscReal :: surf_area_porosity_threshold
+    character(len=MAXWORDLENGTH) :: target_replacement_min_name
+    type(transition_state_prefactor_type), pointer :: prefactor
+    type(nucleation_type), pointer :: nucleation
+    type(transition_state_rxn_type), pointer :: next
+  end type transition_state_rxn_type
+
+  type, public :: transition_state_prefactor_type
+    type(ts_prefactor_species_type), pointer :: species
+    ! these supercede the those above in transition_state_rxn_type
+    PetscReal :: precipitation_rate_constant
+    PetscReal :: dissolution_rate_constant
+    PetscReal :: activation_energy
+    type(transition_state_prefactor_type), pointer :: next
+  end type transition_state_prefactor_type
+
+  type, public :: ts_prefactor_species_type
+    character(len=MAXWORDLENGTH) :: name
+    PetscInt :: id
+    PetscReal :: alpha
+    PetscReal :: beta
+    PetscReal :: attenuation_coef
+    type(ts_prefactor_species_type), pointer :: next
+  end type ts_prefactor_species_type
+
+  type, public :: mineral_constraint_type
+    ! Any changes here must be incorporated within ReactionProcessConstraint()
+    ! where constraints are reordered
+    character(len=MAXWORDLENGTH), pointer :: names(:)
+    PetscReal, pointer :: constraint_vol_frac(:)
+    PetscReal, pointer :: constraint_area(:)
+    character(len=MAXWORDLENGTH), pointer :: constraint_vol_frac_string(:)
+    character(len=MAXWORDLENGTH), pointer :: constraint_area_string(:)
+    character(len=MAXWORDLENGTH), pointer :: constraint_area_units(:)
+    PetscReal, pointer :: constraint_area_conv_factor(:)
+    PetscInt, pointer :: area_units_type(:)
+    PetscBool, pointer :: external_vol_frac_dataset(:)
+    PetscBool, pointer :: external_area_dataset(:)
+    PetscBool :: acknowledge_zero_surface_area
+  end type mineral_constraint_type
+
+  type, public :: nucleation_type
+    character(len=MAXWORDLENGTH) :: name
+    PetscInt :: itype
+    PetscReal :: rate_constant
+    PetscReal :: geometric_shape_factor
+    PetscReal :: heterogenous_correction_factor
+    PetscReal :: surface_tension
+    PetscReal :: gamma
+    type(nucleation_type), pointer :: next
+  end type nucleation_type
+
+  type, public :: mineral_type
+
+    PetscInt :: nmnrl
+    PetscBool :: print_all
+    PetscBool :: print_saturation_index
+    PetscBool :: print_rate
+    PetscBool :: print_volume_fraction
+    PetscBool :: print_sum_volume_fraction
+    PetscBool :: print_surface_area
+    character(len=MAXWORDLENGTH), pointer :: mineral_names(:)
+
+    type(mineral_rxn_type), pointer :: mineral_list
+
+    ! for saturation states
+    PetscInt, pointer :: mnrlspecid(:,:)
+    PetscReal, pointer :: mnrlstoich(:,:)
+    PetscInt, pointer :: mnrlh2oid(:)
+    PetscReal, pointer :: mnrlh2ostoich(:)
+    PetscInt, pointer :: mnrlspecid_in_residual(:,:)
+    PetscReal, pointer :: mnrlstoich_in_residual(:,:)
+    PetscInt, pointer :: mnrlh2oid_in_residual(:)
+    PetscReal, pointer :: mnrlh2ostoich_in_residual(:)
+    PetscReal, pointer :: mnrl_logK(:)
+    PetscReal, pointer :: mnrl_logKcoef(:,:)
+    PetscBool, pointer :: mnrl_print(:)
+
+    ! for kinetic reactions
+    PetscBool :: update_surface_area
+    PetscReal :: rate_constant_scaling_factor
+
+    PetscInt :: nkinmnrl
+    character(len=MAXWORDLENGTH), pointer :: kinmnrl_names(:)
+    character(len=MAXWORDLENGTH), pointer :: kinmnrl_armor_min_names(:)
+    PetscBool, pointer :: kinmnrl_print(:)
+    PetscInt, pointer :: kinmnrl_tst_itype(:)
+    PetscInt, pointer :: kinmnrlspecid(:,:)
+    PetscReal, pointer :: kinmnrlstoich(:,:)
+    PetscInt, pointer :: kinmnrlh2oid(:)
+    PetscReal, pointer :: kinmnrlh2ostoich(:)
+    PetscInt, pointer :: kinmnrlspecid_in_residual(:,:)
+    PetscReal, pointer :: kinmnrlstoich_in_residual(:,:)
+    PetscInt, pointer :: kinmnrlh2oid_in_residual(:)
+    PetscReal, pointer :: kinmnrlh2ostoich_in_residual(:)
+    PetscReal, pointer :: kinmnrl_logK(:)
+    PetscReal, pointer :: kinmnrl_logKcoef(:,:)
+    PetscReal, pointer :: kinmnrl_precip_rate_constant(:)
+    PetscReal, pointer :: kinmnrl_dissol_rate_constant(:)
+    PetscReal, pointer :: kinmnrl_activation_energy(:)
+    PetscReal, pointer :: kinmnrl_molar_vol(:)
+    PetscReal, pointer :: kinmnrl_molar_wt(:)
+    PetscInt, pointer :: kinmnrl_num_prefactors(:)
+    PetscInt, pointer :: kinmnrl_prefactor_id(:,:,:)
+    PetscReal, pointer :: kinmnrl_pref_alpha(:,:,:)
+    PetscReal, pointer :: kinmnrl_pref_beta(:,:,:)
+    PetscReal, pointer :: kinmnrl_pref_atten_coef(:,:,:)
+    PetscReal, pointer :: kinmnrl_pref_precip_rate_const(:,:)
+    PetscReal, pointer :: kinmnrl_pref_dissol_rate_const(:,:)
+    PetscReal, pointer :: kinmnrl_pref_activation_energy(:,:)
+    PetscReal, pointer :: kinmnrl_mnrl_scale_factor(:)
+    PetscReal, pointer :: kinmnrl_Temkin_const(:)
+    PetscReal, pointer :: kinmnrl_affinity_power(:)
+    PetscReal, pointer :: kinmnrl_affinity_threshold(:)
+    PetscReal, pointer :: kinmnrl_rate_limiter(:)
+    PetscReal, pointer :: kinmnrl_surf_area_vol_frac_pwr(:)
+    PetscReal, pointer :: kinmnrl_surf_area_porosity_pwr(:)
+    PetscReal, pointer :: kinmnrl_armor_crit_vol_frac(:)
+    PetscReal, pointer :: kinmnrl_armor_pwr(:)
+    PetscReal, pointer :: kinmnrl_surf_area_epsilon(:)
+    PetscReal, pointer :: kinmnrl_vol_frac_epsilon(:)
+    PetscReal, pointer :: kinmnrl_spec_surf_area(:)
+    PetscReal, pointer :: kinmnrl_surf_area_porosity_threshold(:)
+    PetscInt, pointer :: kinmnrl_surf_area_function(:)
+    PetscInt, pointer :: kinmnrl_target_replacement_id(:)
+
+    PetscInt, pointer :: kinmnrl_nucleation_id(:)
+    type(nucleation_type), pointer :: nucleation_list
+    type(nucleation_type), pointer :: nucleation_array(:)
+
+  end type mineral_type
+
+  interface ReactionMnrlGetMnrlIDFromName
+    module procedure ReactionMnrlGetMnrlIDFromName1
+    module procedure ReactionMnrlGetMnrlIDFromName2
+  end interface
+
+  public :: ReactionMnrlCreateAux, &
+            ReactionMnrlGetMineralCount, &
+            ReactionMnrlGetMineralNames, &
+            ReactionMnrlGetMnrlIDFromName, &
+            ReactionMnrlGetKinMnrlIDFromName, &
+            ReactionMnrlGetMnrlPtrFromName, &
+            ReactionMnrlAnyUpdatePorosity, &
+            ReactionMnrlCreateTSTRxn, &
+            ReactionMnrlCreateTSTPrefactor, &
+            ReactionMnrlCreateTSTPrefSpec, &
+            ReactionMnrlCreateNucleation, &
+            ReactionMnrlCopyNucleation, &
+            ReactionMnrlDestroyTSTRxn, &
+            ReactionMnrlCreateMineralRxn, &
+            ReactionMnrlDestroyMineralRxn, &
+            ReactionMnrlCreateMnrlConstraint, &
+            ReactionMnrlDestMnrlConstraint, &
+            ReactionMnrlDestroyAux
+
+contains
+
+! ************************************************************************** !
+
+function ReactionMnrlCreateAux()
+  !
+  ! Allocate and initialize mineral reaction object
+  !
+  ! Author: Glenn Hammond
+  ! Date: 08/16/12
+  !
+  implicit none
+
+  type(mineral_type), pointer :: ReactionMnrlCreateAux
+
+  type(mineral_type), pointer :: mineral
+
+  allocate(mineral)
+
+  nullify(mineral%mineral_list)
+  mineral%print_all = PETSC_FALSE
+  mineral%print_volume_fraction = PETSC_TRUE
+  mineral%print_sum_volume_fraction = PETSC_FALSE
+  mineral%print_rate = PETSC_TRUE
+  mineral%print_saturation_index = PETSC_FALSE
+  mineral%print_surface_area = PETSC_FALSE
+
+  ! for saturation states
+  mineral%nmnrl = 0
+  nullify(mineral%mineral_names)
+  nullify(mineral%mnrl_print)
+  nullify(mineral%mnrlspecid)
+  nullify(mineral%mnrlh2oid)
+  nullify(mineral%mnrlstoich)
+  nullify(mineral%mnrlh2ostoich)
+  nullify(mineral%mnrlspecid_in_residual)
+  nullify(mineral%mnrlh2oid_in_residual)
+  nullify(mineral%mnrlstoich_in_residual)
+  nullify(mineral%mnrlh2ostoich_in_residual)
+  nullify(mineral%mnrl_logK)
+  nullify(mineral%mnrl_logKcoef)
+
+  ! for kinetic mineral reactions
+  mineral%nkinmnrl = 0
+  mineral%update_surface_area = PETSC_FALSE
+  mineral%rate_constant_scaling_factor = 1.d0
+  nullify(mineral%kinmnrl_names)
+  nullify(mineral%kinmnrl_print)
+  nullify(mineral%kinmnrl_tst_itype)
+  nullify(mineral%kinmnrlspecid)
+  nullify(mineral%kinmnrlstoich)
+  nullify(mineral%kinmnrlh2oid)
+  nullify(mineral%kinmnrlh2ostoich)
+  nullify(mineral%kinmnrlspecid_in_residual)
+  nullify(mineral%kinmnrlstoich_in_residual)
+  nullify(mineral%kinmnrlh2oid_in_residual)
+  nullify(mineral%kinmnrlh2ostoich_in_residual)
+  nullify(mineral%kinmnrl_logK)
+  nullify(mineral%kinmnrl_logKcoef)
+  nullify(mineral%kinmnrl_precip_rate_constant)
+  nullify(mineral%kinmnrl_dissol_rate_constant)
+  nullify(mineral%kinmnrl_activation_energy)
+  nullify(mineral%kinmnrl_molar_vol)
+  nullify(mineral%kinmnrl_molar_wt)
+
+  nullify(mineral%kinmnrl_num_prefactors)
+  nullify(mineral%kinmnrl_prefactor_id)
+  nullify(mineral%kinmnrl_pref_alpha)
+  nullify(mineral%kinmnrl_pref_beta)
+  nullify(mineral%kinmnrl_pref_atten_coef)
+  nullify(mineral%kinmnrl_pref_precip_rate_const)
+  nullify(mineral%kinmnrl_pref_dissol_rate_const)
+  nullify(mineral%kinmnrl_pref_activation_energy)
+
+  nullify(mineral%kinmnrl_mnrl_scale_factor)
+  nullify(mineral%kinmnrl_Temkin_const)
+  nullify(mineral%kinmnrl_affinity_power)
+  nullify(mineral%kinmnrl_affinity_threshold)
+  nullify(mineral%kinmnrl_rate_limiter)
+  nullify(mineral%kinmnrl_surf_area_vol_frac_pwr)
+  nullify(mineral%kinmnrl_surf_area_porosity_pwr)
+
+  nullify(mineral%kinmnrl_armor_min_names)
+  nullify(mineral%kinmnrl_armor_crit_vol_frac)
+  nullify(mineral%kinmnrl_armor_pwr)
+
+  nullify(mineral%kinmnrl_surf_area_epsilon)
+  nullify(mineral%kinmnrl_vol_frac_epsilon)
+  nullify(mineral%kinmnrl_spec_surf_area)
+  nullify(mineral%kinmnrl_surf_area_porosity_threshold)
+  nullify(mineral%kinmnrl_surf_area_function)
+  nullify(mineral%kinmnrl_target_replacement_id)
+
+  ! for nucleation
+  nullify(mineral%kinmnrl_nucleation_id)
+  nullify(mineral%nucleation_list)
+  nullify(mineral%nucleation_array)
+
+  ReactionMnrlCreateAux => mineral
+
+end function ReactionMnrlCreateAux
+
+! ************************************************************************** !
+
+function ReactionMnrlCreateMineralRxn()
+  !
+  ! Allocate and initialize a mineral object
+  !
+  ! Author: Glenn Hammond
+  ! Date: 05/02/08
+  !
+  implicit none
+
+  type(mineral_rxn_type), pointer :: ReactionMnrlCreateMineralRxn
+
+  type(mineral_rxn_type), pointer :: mineral
+
+  allocate(mineral)
+  mineral%id = 0
+  mineral%itype = 0
+  mineral%name = ''
+  mineral%molar_volume = 0.d0
+  mineral%molar_weight = 0.d0
+  mineral%print_me = PETSC_FALSE
+  nullify(mineral%dbaserxn)
+  nullify(mineral%mass_action_override)
+  nullify(mineral%tstrxn)
+  nullify(mineral%next)
+
+  ReactionMnrlCreateMineralRxn => mineral
+
+end function ReactionMnrlCreateMineralRxn
+
+! ************************************************************************** !
+
+function ReactionMnrlCreateTSTRxn()
+  !
+  ! Allocate and initialize a transition state
+  ! theory reaction
+  !
+  ! Author: Glenn Hammond
+  ! Date: 09/01/08
+  !
+
+  implicit none
+
+  type(transition_state_rxn_type), pointer :: ReactionMnrlCreateTSTRxn
+
+  type(transition_state_rxn_type), pointer :: tstrxn
+
+  allocate(tstrxn)
+  tstrxn%mnrl_scale_factor = UNINITIALIZED_DOUBLE
+  tstrxn%affinity_factor_sigma = UNINITIALIZED_DOUBLE
+  tstrxn%affinity_factor_beta = UNINITIALIZED_DOUBLE
+  tstrxn%affinity_threshold = UNINITIALIZED_DOUBLE
+  tstrxn%surf_area_vol_frac_pwr = 2.d0/3.d0
+  tstrxn%surf_area_porosity_pwr = 2.d0/3.d0
+  tstrxn%surf_area_vol_frac_pwr_set = PETSC_FALSE
+  tstrxn%surf_area_porosity_pwr_set = PETSC_FALSE
+  tstrxn%rate_limiter = UNINITIALIZED_DOUBLE
+  tstrxn%activation_energy = UNINITIALIZED_DOUBLE
+  tstrxn%armor_min_name = ''
+  tstrxn%armor_pwr = 0.d0
+  tstrxn%armor_crit_vol_frac = 0.d0
+  tstrxn%surf_area_epsilon = 0.d0
+  tstrxn%vol_frac_epsilon = 0.d0
+  tstrxn%surf_area_function = MINERAL_SURF_AREA_F_NULL
+  tstrxn%spec_surf_area = UNINITIALIZED_DOUBLE
+  tstrxn%surf_area_porosity_threshold = UNINITIALIZED_DOUBLE
+  tstrxn%target_replacement_min_name = ''
+  tstrxn%precipitation_rate_constant = UNINITIALIZED_DOUBLE
+  tstrxn%dissolution_rate_constant = UNINITIALIZED_DOUBLE
+  nullify(tstrxn%prefactor)
+  nullify(tstrxn%nucleation)
+  nullify(tstrxn%next)
+
+  ReactionMnrlCreateTSTRxn => tstrxn
+
+end function ReactionMnrlCreateTSTRxn
+
+! ************************************************************************** !
+
+function ReactionMnrlCreateTSTPrefactor()
+  !
+  ! Allocate and initialize a transition state
+  ! theory prefactor
+  !
+  ! Author: Glenn Hammond
+  ! Date: 07/29/11
+  !
+
+  implicit none
+
+  type(transition_state_prefactor_type), pointer :: &
+    ReactionMnrlCreateTSTPrefactor
+
+  type(transition_state_prefactor_type), pointer :: prefactor
+
+  allocate(prefactor)
+  prefactor%precipitation_rate_constant = UNINITIALIZED_DOUBLE
+  prefactor%dissolution_rate_constant = UNINITIALIZED_DOUBLE
+  prefactor%activation_energy = 0.d0
+  nullify(prefactor%species)
+  nullify(prefactor%next)
+
+  ReactionMnrlCreateTSTPrefactor => prefactor
+
+end function ReactionMnrlCreateTSTPrefactor
+
+! ************************************************************************** !
+
+function ReactionMnrlCreateTSTPrefSpec()
+  !
+  ! Allocate and initialize a transition state
+  ! theory prefactor species
+  !
+  ! Author: Glenn Hammond
+  ! Date: 08/01/11
+  !
+
+  implicit none
+
+  type(ts_prefactor_species_type), pointer :: ReactionMnrlCreateTSTPrefSpec
+
+  type(ts_prefactor_species_type), pointer :: species
+
+  allocate(species)
+  species%name = ''
+  species%id = 0
+  species%alpha = 0.d0
+  species%beta = 0.d0
+  species%attenuation_coef = 0.d0
+  nullify(species%next)
+
+  ReactionMnrlCreateTSTPrefSpec => species
+
+end function ReactionMnrlCreateTSTPrefSpec
+
+! ************************************************************************** !
+
+function ReactionMnrlCreateNucleation()
+  !
+  ! Allocate and initialize a nucleation reaction
+  !
+  ! Author: Glenn Hammond
+  ! Date: 01/20/25
+  !
+  implicit none
+
+  type(nucleation_type), pointer :: ReactionMnrlCreateNucleation
+
+  type(nucleation_type), pointer :: nucleation
+
+  allocate(nucleation)
+  nucleation%name = ''
+  nucleation%itype = UNINITIALIZED_INTEGER
+  nucleation%rate_constant = UNINITIALIZED_DOUBLE
+  nucleation%geometric_shape_factor = UNINITIALIZED_DOUBLE
+  nucleation%heterogenous_correction_factor = UNINITIALIZED_DOUBLE
+  nucleation%surface_tension = UNINITIALIZED_DOUBLE
+  nucleation%gamma = UNINITIALIZED_DOUBLE
+  nullify(nucleation%next)
+
+  ReactionMnrlCreateNucleation => nucleation
+
+end function ReactionMnrlCreateNucleation
+
+! ************************************************************************** !
+
+subroutine ReactionMnrlCopyNucleation(nucleation1,nucleation2)
+  !
+  ! Allocate and initialize a nucleation reaction
+  !
+  ! Author: Glenn Hammond
+  ! Date: 01/20/25
+  !
+  implicit none
+
+  type(nucleation_type) :: nucleation1
+  type(nucleation_type) :: nucleation2
+
+  nucleation2%name = nucleation1%name
+  nucleation2%itype = nucleation1%itype
+  nucleation2%rate_constant = nucleation1%rate_constant
+  nucleation2%geometric_shape_factor = nucleation1%geometric_shape_factor
+  nucleation2%heterogenous_correction_factor = &
+    nucleation1%heterogenous_correction_factor
+  nucleation2%surface_tension = nucleation1%surface_tension
+  nucleation2%gamma = nucleation1%gamma
+  nucleation2%next => nucleation1%next
+
+end subroutine ReactionMnrlCopyNucleation
+
+! ************************************************************************** !
+
+function ReactionMnrlCreateMnrlConstraint(mineral,option)
+  !
+  ! Creates a mineral constraint object
+  !
+  ! Author: Glenn Hammond
+  ! Date: 10/14/08
+  !
+  use Option_module
+
+  implicit none
+
+  type(mineral_type) :: mineral
+  type(option_type) :: option
+  type(mineral_constraint_type), pointer :: ReactionMnrlCreateMnrlConstraint
+
+  type(mineral_constraint_type), pointer :: constraint
+
+  allocate(constraint)
+  allocate(constraint%names(mineral%nkinmnrl))
+  constraint%names = ''
+  allocate(constraint%constraint_vol_frac(mineral%nkinmnrl))
+  constraint%constraint_vol_frac = UNINITIALIZED_DOUBLE
+  allocate(constraint%constraint_area(mineral%nkinmnrl))
+  constraint%constraint_area = UNINITIALIZED_DOUBLE
+  allocate(constraint%constraint_vol_frac_string(mineral%nkinmnrl))
+  constraint%constraint_vol_frac_string = ''
+  allocate(constraint%constraint_area_string(mineral%nkinmnrl))
+  constraint%constraint_area_string = ''
+  allocate(constraint%constraint_area_units(mineral%nkinmnrl))
+  constraint%constraint_area_units = ''
+  allocate(constraint%constraint_area_conv_factor(mineral%nkinmnrl))
+  constraint%constraint_area_conv_factor = UNINITIALIZED_DOUBLE
+  allocate(constraint%area_units_type(mineral%nkinmnrl))
+  constraint%area_units_type = UNINITIALIZED_INTEGER
+  allocate(constraint%external_vol_frac_dataset(mineral%nkinmnrl))
+  constraint%external_vol_frac_dataset = PETSC_FALSE
+  allocate(constraint%external_area_dataset(mineral%nkinmnrl))
+  constraint%external_area_dataset = PETSC_FALSE
+  constraint%acknowledge_zero_surface_area = PETSC_FALSE
+
+  ReactionMnrlCreateMnrlConstraint => constraint
+
+end function ReactionMnrlCreateMnrlConstraint
+
+! ************************************************************************** !
+
+function ReactionMnrlGetMnrlPtrFromName(name,mineral)
+  !
+  ! Returns the mineral corresponding to the name
+  !
+  ! Author: Glenn Hammond
+  ! Date: 11/22/17
+  !
+  use String_module
+
+  implicit none
+
+  character(len=MAXWORDLENGTH) :: name
+  type(mineral_type) :: mineral
+
+  type(mineral_rxn_type), pointer :: ReactionMnrlGetMnrlPtrFromName
+
+  ReactionMnrlGetMnrlPtrFromName => mineral%mineral_list
+  do
+    if (.not.associated(ReactionMnrlGetMnrlPtrFromName)) exit
+    if (StringCompare(name,ReactionMnrlGetMnrlPtrFromName%name, &
+                      MAXWORDLENGTH)) return
+    ReactionMnrlGetMnrlPtrFromName => ReactionMnrlGetMnrlPtrFromName%next
+  enddo
+
+end function ReactionMnrlGetMnrlPtrFromName
+
+! ************************************************************************** !
+
+function ReactionMnrlGetMineralNames(mineral)
+  !
+  ! Returns the names of minerals in an array
+  !
+  ! Author: Glenn Hammond
+  ! Date: 09/04/08
+  !
+
+  implicit none
+
+  character(len=MAXWORDLENGTH), pointer :: ReactionMnrlGetMineralNames(:)
+  type(mineral_type) :: mineral
+
+  PetscInt :: count
+  character(len=MAXWORDLENGTH), pointer :: names(:)
+  type(mineral_rxn_type), pointer :: cur_mineral
+
+  count = ReactionMnrlGetMineralCount(mineral)
+  allocate(names(count))
+
+  count = 1
+  cur_mineral => mineral%mineral_list
+  do
+    if (.not.associated(cur_mineral)) exit
+    names(count) = cur_mineral%name
+    count = count + 1
+    cur_mineral => cur_mineral%next
+  enddo
+
+  ReactionMnrlGetMineralNames => names
+
+end function ReactionMnrlGetMineralNames
+
+! ************************************************************************** !
+
+function ReactionMnrlGetMineralCount(mineral)
+  !
+  ! Returns the number of minerals
+  !
+  ! Author: Glenn Hammond
+  ! Date: 06/02/08
+  !
+
+  implicit none
+
+  PetscInt :: ReactionMnrlGetMineralCount
+  type(mineral_type) :: mineral
+
+  type(mineral_rxn_type), pointer :: cur_mineral
+
+  ReactionMnrlGetMineralCount = 0
+  cur_mineral => mineral%mineral_list
+  do
+    if (.not.associated(cur_mineral)) exit
+    ReactionMnrlGetMineralCount = ReactionMnrlGetMineralCount + 1
+    cur_mineral => cur_mineral%next
+  enddo
+
+end function ReactionMnrlGetMineralCount
+
+! ************************************************************************** !
+
+function ReactionMnrlGetMnrlIDFromName1(name,mineral,option)
+  !
+  ! Returns the id of mineral with the corresponding name
+  !
+  ! Author: Glenn Hammond
+  ! Date: 09/04/08
+  !
+  use Option_module
+  use String_module
+
+  implicit none
+
+  type(mineral_type) :: mineral
+  character(len=MAXWORDLENGTH) :: name
+  type(option_type) :: option
+
+  PetscInt :: ReactionMnrlGetMnrlIDFromName1
+
+  ReactionMnrlGetMnrlIDFromName1 = &
+    ReactionMnrlGetMnrlIDFromName(name,mineral,PETSC_FALSE,PETSC_TRUE,option)
+
+end function ReactionMnrlGetMnrlIDFromName1
+
+! ************************************************************************** !
+
+function ReactionMnrlGetMnrlIDFromName2(name,mineral,must_be_kinetic, &
+                                        throw_error,option)
+  !
+  ! Returns the id of mineral with the corresponding name
+  !
+  ! Author: Glenn Hammond
+  ! Date: 09/04/08
+  !
+  use Option_module
+  use String_module
+
+  implicit none
+
+  type(mineral_type) :: mineral
+  character(len=MAXWORDLENGTH) :: name
+  PetscBool :: must_be_kinetic
+  PetscBool :: throw_error
+  type(option_type) :: option
+
+  PetscInt :: ReactionMnrlGetMnrlIDFromName2
+  type(mineral_rxn_type), pointer :: cur_mineral
+  PetscInt :: ikinmnrl
+
+  ReactionMnrlGetMnrlIDFromName2 = -1
+
+  cur_mineral => mineral%mineral_list
+  ikinmnrl = 0
+  do
+    if (.not.associated(cur_mineral)) exit
+    if (cur_mineral%itype == MINERAL_KINETIC) then
+      ikinmnrl = ikinmnrl + 1
+    endif
+    if (StringCompare(name,cur_mineral%name,MAXWORDLENGTH)) then
+      if (must_be_kinetic .and. cur_mineral%itype /= MINERAL_KINETIC) exit
+      if (must_be_kinetic) then
+        ReactionMnrlGetMnrlIDFromName2 = ikinmnrl
+        exit
+      endif
+      ReactionMnrlGetMnrlIDFromName2 = cur_mineral%id
+      exit
+    endif
+    cur_mineral => cur_mineral%next
+  enddo
+
+  if (throw_error .and. ReactionMnrlGetMnrlIDFromName2 <= 0) then
+    option%io_buffer = 'Mineral "' // trim(name) // &
+      '" not found among minerals in ReactionMnrlGetMnrlIDFromName().'
+    call PrintErrMsg(option)
+  endif
+
+end function ReactionMnrlGetMnrlIDFromName2
+
+! ************************************************************************** !
+
+function ReactionMnrlGetKinMnrlIDFromName(name,mineral,option)
+  !
+  ! Returns the id of kinetic mineral with the
+  ! corresponding name
+  !
+  ! Author: Glenn Hammond
+  ! Date: 03/11/13
+  !
+  use Option_module
+  use String_module
+
+  implicit none
+
+  character(len=MAXWORDLENGTH) :: name
+  type(mineral_type) :: mineral
+  type(option_type) :: option
+
+  PetscInt :: ReactionMnrlGetKinMnrlIDFromName
+
+  ReactionMnrlGetKinMnrlIDFromName = &
+    ReactionMnrlGetMnrlIDFromName(name,mineral,PETSC_TRUE,PETSC_FALSE,option)
+
+  if (ReactionMnrlGetKinMnrlIDFromName <= 0) then
+    option%io_buffer = 'Mineral "' // trim(name) // &
+      '" not found among kinetic minerals in &
+      &ReactionMnrlGetKinMnrlIDFromName().'
+    call PrintErrMsg(option)
+  endif
+
+end function ReactionMnrlGetKinMnrlIDFromName
+
+! ************************************************************************** !
+
+function ReactionMnrlAnyUpdatePorosity(mineral)
+  !
+  ! Indicates whethern any mineral surface areas are based on porosity
+  !
+  ! Author: Glenn Hammond
+  ! Date: 01/13/25
+  !
+  implicit none
+
+  type(mineral_type) :: mineral
+
+  type(mineral_rxn_type), pointer :: cur_mineral
+
+  PetscBool :: ReactionMnrlAnyUpdatePorosity
+
+  ReactionMnrlAnyUpdatePorosity = PETSC_FALSE
+  cur_mineral => mineral%mineral_list
+  do
+    if (.not.associated(cur_mineral)) exit
+    if (associated(cur_mineral%tstrxn)) then
+      if (cur_mineral%tstrxn%surf_area_function == &
+          MINERAL_SURF_AREA_F_POR_RATIO .or. &
+          cur_mineral%tstrxn%surf_area_function == &
+          MINERAL_SURF_AREA_F_MNRL_MASS_CAPPED .or. &
+          cur_mineral%tstrxn%surf_area_function == &
+          MINERAL_SURF_AREA_F_POR_VF_RATIO) then
+        ReactionMnrlAnyUpdatePorosity = PETSC_TRUE
+        return
+      endif
+    endif
+    cur_mineral => cur_mineral%next
+  enddo
+
+end function ReactionMnrlAnyUpdatePorosity
+
+! ************************************************************************** !
+
+subroutine ReactionMnrlDestroyMineralRxn(mineral)
+  !
+  ! ReactionMnrlDestroyAux: Deallocates a mineral rxn object
+  !
+  ! Author: Glenn Hammond
+  ! Date: 05/29/08
+  !
+
+  implicit none
+
+  type(mineral_rxn_type), pointer :: mineral
+
+  call ReactionDBDestroyRxn(mineral%dbaserxn)
+  call ReactionDBDestroyMassActOverride(mineral%mass_action_override)
+  call ReactionMnrlDestroyTSTRxn(mineral%tstrxn)
+
+  deallocate(mineral)
+  nullify(mineral)
+
+end subroutine ReactionMnrlDestroyMineralRxn
+
+! ************************************************************************** !
+
+recursive subroutine ReactionMnrlDestroyTSTRxn(tstrxn)
+  !
+  ! Deallocates a transition state reaction
+  !
+  ! Author: Glenn Hammond
+  ! Date: 05/29/08
+  !
+
+  implicit none
+
+  type(transition_state_rxn_type), pointer :: tstrxn
+
+  if (.not.associated(tstrxn)) return
+
+  call ReactionMnrlDestroyTSTRxn(tstrxn%next)
+  call ReactionMnrlDestroyTSTPrefactor(tstrxn%prefactor)
+  call ReactionMnrlDestroyNucleation(tstrxn%nucleation)
+
+  deallocate(tstrxn)
+  nullify(tstrxn)
+
+end subroutine ReactionMnrlDestroyTSTRxn
+
+! ************************************************************************** !
+
+recursive subroutine ReactionMnrlDestroyTSTPrefactor(prefactor)
+  !
+  ! Deallocates a transition state prefactor
+  !
+  ! Author: Glenn Hammond
+  ! Date: 07/29/11
+  !
+
+  implicit none
+
+  type(transition_state_prefactor_type), pointer :: prefactor
+
+  if (.not.associated(prefactor)) return
+
+  call ReactionMnrlDestroyTSTPrefactor(prefactor%next)
+  call ReactionMnrlDestroyTSTPrefSpec(prefactor%species)
+
+  deallocate(prefactor)
+  nullify(prefactor)
+
+end subroutine ReactionMnrlDestroyTSTPrefactor
+
+! ************************************************************************** !
+
+recursive subroutine ReactionMnrlDestroyTSTPrefSpec(species)
+  !
+  ! Deallocates a transition state prefactor
+  !
+  ! Author: Glenn Hammond
+  ! Date: 08/01/11
+  !
+
+  implicit none
+
+  type(ts_prefactor_species_type), pointer :: species
+
+  if (.not.associated(species)) return
+
+  call ReactionMnrlDestroyTSTPrefSpec(species%next)
+
+  deallocate(species)
+  nullify(species)
+
+end subroutine ReactionMnrlDestroyTSTPrefSpec
+
+! ************************************************************************** !
+
+recursive subroutine ReactionMnrlDestroyNucleation(nucleation)
+  !
+  ! Deallocates a transition state reaction
+  !
+  ! Author: Glenn Hammond
+  ! Date: 05/29/08
+  !
+
+  implicit none
+
+  type(nucleation_type), pointer :: nucleation
+
+  if (.not.associated(nucleation)) return
+
+  call ReactionMnrlDestroyNucleation(nucleation%next)
+
+  deallocate(nucleation)
+  nullify(nucleation)
+
+end subroutine ReactionMnrlDestroyNucleation
+
+! ************************************************************************** !
+
+subroutine ReactionMnrlDestMnrlConstraint(constraint)
+  !
+  ! Destroys a mineral constraint object
+  !
+  ! Author: Glenn Hammond
+  ! Date: 10/14/08
+  !
+
+  use Utility_module, only: DeallocateArray
+
+  implicit none
+
+  type(mineral_constraint_type), pointer :: constraint
+
+  if (.not.associated(constraint)) return
+
+  call DeallocateArray(constraint%names)
+  call DeallocateArray(constraint%constraint_vol_frac)
+  call DeallocateArray(constraint%constraint_area)
+  call DeallocateArray(constraint%constraint_vol_frac_string)
+  call DeallocateArray(constraint%constraint_area_string)
+  call DeallocateArray(constraint%constraint_area_units)
+  call DeallocateArray(constraint%constraint_area_conv_factor)
+  call DeallocateArray(constraint%area_units_type)
+  call DeallocateArray(constraint%external_area_dataset)
+  call DeallocateArray(constraint%external_vol_frac_dataset)
+
+  deallocate(constraint)
+  nullify(constraint)
+
+end subroutine ReactionMnrlDestMnrlConstraint
+
+! ************************************************************************** !
+
+subroutine ReactionMnrlDestroyAux(mineral)
+  !
+  ! Deallocates a mineral object
+  !
+  ! Author: Glenn Hammond
+  ! Date: 05/29/08
+  !
+
+  use Utility_module, only: DeallocateArray
+
+  implicit none
+
+  type(mineral_type), pointer :: mineral
+
+  type(mineral_rxn_type), pointer :: cur_mineral, prev_mineral
+
+  if (.not.associated(mineral)) return
+
+  ! mineral species
+  cur_mineral => mineral%mineral_list
+  do
+    if (.not.associated(cur_mineral)) exit
+    prev_mineral => cur_mineral
+    cur_mineral => cur_mineral%next
+    call ReactionMnrlDestroyMineralRxn(prev_mineral)
+  enddo
+  nullify(mineral%mineral_list)
+
+  call DeallocateArray(mineral%mineral_names)
+  call DeallocateArray(mineral%kinmnrl_names)
+  call DeallocateArray(mineral%mnrl_print)
+  call DeallocateArray(mineral%kinmnrl_print)
+  call DeallocateArray(mineral%kinmnrl_tst_itype)
+  call DeallocateArray(mineral%mnrlspecid)
+  call DeallocateArray(mineral%mnrlstoich)
+  call DeallocateArray(mineral%mnrlh2oid)
+  call DeallocateArray(mineral%mnrlh2ostoich)
+  call DeallocateArray(mineral%mnrlspecid_in_residual)
+  call DeallocateArray(mineral%mnrlstoich_in_residual)
+  call DeallocateArray(mineral%mnrlh2oid_in_residual)
+  call DeallocateArray(mineral%mnrlh2ostoich_in_residual)
+  call DeallocateArray(mineral%mnrl_logK)
+  call DeallocateArray(mineral%mnrl_logKcoef)
+
+  call DeallocateArray(mineral%kinmnrlspecid)
+  call DeallocateArray(mineral%kinmnrlstoich)
+  call DeallocateArray(mineral%kinmnrlh2oid)
+  call DeallocateArray(mineral%kinmnrlh2ostoich)
+  call DeallocateArray(mineral%kinmnrlspecid_in_residual)
+  call DeallocateArray(mineral%kinmnrlstoich_in_residual)
+  call DeallocateArray(mineral%kinmnrlh2oid_in_residual)
+  call DeallocateArray(mineral%kinmnrlh2ostoich_in_residual)
+  call DeallocateArray(mineral%kinmnrl_logK)
+  call DeallocateArray(mineral%kinmnrl_logKcoef)
+  call DeallocateArray(mineral%kinmnrl_precip_rate_constant)
+  call DeallocateArray(mineral%kinmnrl_dissol_rate_constant)
+  call DeallocateArray(mineral%kinmnrl_molar_vol)
+  call DeallocateArray(mineral%kinmnrl_molar_wt)
+
+  call DeallocateArray(mineral%kinmnrl_num_prefactors)
+  call DeallocateArray(mineral%kinmnrl_prefactor_id)
+  call DeallocateArray(mineral%kinmnrl_pref_alpha)
+  call DeallocateArray(mineral%kinmnrl_pref_beta)
+  call DeallocateArray(mineral%kinmnrl_pref_atten_coef)
+  call DeallocateArray(mineral%kinmnrl_pref_precip_rate_const)
+  call DeallocateArray(mineral%kinmnrl_pref_dissol_rate_const)
+  call DeallocateArray(mineral%kinmnrl_pref_activation_energy)
+
+  call DeallocateArray(mineral%kinmnrl_mnrl_scale_factor)
+  call DeallocateArray(mineral%kinmnrl_Temkin_const)
+  call DeallocateArray(mineral%kinmnrl_affinity_power)
+  call DeallocateArray(mineral%kinmnrl_affinity_threshold)
+  call DeallocateArray(mineral%kinmnrl_activation_energy)
+  call DeallocateArray(mineral%kinmnrl_rate_limiter)
+  call DeallocateArray(mineral%kinmnrl_surf_area_vol_frac_pwr)
+  call DeallocateArray(mineral%kinmnrl_surf_area_porosity_pwr)
+  call DeallocateArray(mineral%kinmnrl_armor_min_names)
+  call DeallocateArray(mineral%kinmnrl_armor_pwr)
+  call DeallocateArray(mineral%kinmnrl_armor_crit_vol_frac)
+
+  call DeallocateArray(mineral%kinmnrl_surf_area_epsilon)
+  call DeallocateArray(mineral%kinmnrl_vol_frac_epsilon)
+  call DeallocateArray(mineral%kinmnrl_spec_surf_area)
+  call DeallocateArray(mineral%kinmnrl_surf_area_porosity_threshold)
+  call DeallocateArray(mineral%kinmnrl_surf_area_function)
+  call DeallocateArray(mineral%kinmnrl_target_replacement_id)
+
+  call DeallocateArray(mineral%kinmnrl_nucleation_id)
+  call ReactionMnrlDestroyNucleation(mineral%nucleation_list)
+  if (associated(mineral%nucleation_array)) then
+    deallocate(mineral%nucleation_array)
+    nullify(mineral%nucleation_array)
+  endif
+
+  deallocate(mineral)
+  nullify(mineral)
+
+end subroutine ReactionMnrlDestroyAux
+
+end module Reaction_Mineral_Aux_module

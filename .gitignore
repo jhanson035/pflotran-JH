@@ -1,0 +1,17 @@
+*.o
+*.mod
+*.MOD
+*.a
+*.so
+*.pyc
+__pycache__/
+.DS_Store
+.vscode/
+build/
+bin/
+src/pflotran/pflotran
+src/pflotran/pflotran_rxn
+src/pflotran/pflotran_provenance.F90
+src/pflotran/pflotran_dependencies.txt
+src/pflotran/pflotran_source_files.txt
+src/clm-pflotran/pflotran_interface
